@@ -1,6 +1,3 @@
 # CodeLab
-Just for store code adjusted
-
-made by JWH 2022-12-08
-
-to save myself code 
+made by JWH 2023-04-16
+code based on mae

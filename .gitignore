@@ -1,0 +1,6 @@
+# 注释 忽略上传非代码部分
+*.pth
+*.txt
+*.out
+/__pycache__
+/save

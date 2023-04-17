@@ -19,14 +19,18 @@ from torch.nn.parallel import DataParallel
 # torch.backends.cudnn.benchmark = True
 from models.models_mae import mae_vit_base_patch16
 # from sklearn import svm     #导入算法模块
+import timm
 
+# assert timm.__version__ == "0.3.2" # version check
+from timm.models.layers import trunc_normal_
+from models import models_vit
 #--------------参数设置--------------------
 import argparse
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--image_size', default=224, type=int, choices=[84, 224], help='input image size, 84 for miniImagenet and tieredImagenet, 224 for cub')
 parser.add_argument('--dataset', default='mini_imagenet', choices=['mini_imagenet','tiered_imagenet','cub'])
-parser.add_argument('--data_path', default='/home/jiangweihao/data/mini-imagenet/',type=str, help='dataset path')
+parser.add_argument('--data_path', default='/home/jiangweihao/CodeLab/data/mini-imagenet/',type=str, help='dataset path')
 
 parser.add_argument('--train_n_episode', default=300, type=int, help='number of episodes in meta train')
 parser.add_argument('--val_n_episode', default=300, type=int, help='number of episodes in meta val')
@@ -35,21 +39,23 @@ parser.add_argument('--val_n_way', default=5, type=int, help='number of classes 
 parser.add_argument('--n_shot', default=1, type=int, help='number of labeled data in each class, same as n_support')
 parser.add_argument('--n_query', default=15, type=int, help='number of unlabeled data in each class')
 parser.add_argument('--num_classes', default=64, type=int, help='total number of classes in pretrain')
-
+parser.add_argument('--model', default='vit_base_patch16', type=str, metavar='MODEL',
+                        help='Name of model to train')
+parser.add_argument('--global_pool', action='store_true')
 parser.add_argument('--batch_size', default=128, type=int, help='total number of batch_size in pretrain')
-parser.add_argument('--freq', default=10, type=int, help='total number of inner frequency')
+parser.add_argument('--print_freq', default=10, type=int, help='total number of inner frequency')
 
 parser.add_argument('--momentum', default=0.9, type=int, help='parameter of optimization')
 parser.add_argument('--weight_decay', default=5.e-4, type=int, help='parameter of optimization')
 
-parser.add_argument('--gpu', default='3')
+parser.add_argument('--gpu', default='0')
 parser.add_argument('--epochs', default=100)
 
 params = parser.parse_args()
 
 # 设置日志记录路径
 log_path = os.path.dirname(os.path.abspath(__file__))
-log_path = os.path.join(log_path,'save/{}_{}_{}_mae_kmeans'.format(params.dataset,params.train_n_episode,params.n_shot))
+log_path = os.path.join(log_path,'save/{}_{}_{}_mae_image_compose'.format(params.dataset,params.train_n_episode,params.n_shot))
 ensure_path(log_path)
 set_log_path(log_path)
 log('log and pth save path:  %s'%(log_path))
@@ -107,17 +113,17 @@ val_loader = val_datamgr.get_data_loader(val_file, aug=False)
 # print(label2.size())
 
 # ----------- 导入模型 -------------------------
-model = mae_vit_base_patch16()
-state_dict = torch.load('/home/jiangweihao/code/MAE_fsl/mae_pretrain_vit_base.pth')
-state_dict = state_dict['model']
-model.load_state_dict(state_dict,strict=False)  # 
-model.cuda()
+# model = mae_vit_base_patch16()
+# state_dict = torch.load('/home/jiangweihao/CodeLab/PytorchCode/mae_fsl/checkpoint/mae_pretrain_vit_base.pth')
+# state_dict = state_dict['model']
+# model.load_state_dict(state_dict,strict=False)  # 
+# model.cuda()
 
-# from torchinfo import summary
-# summary(model,[5,3,224,224])
+# # from torchinfo import summary
+# # summary(model,[5,3,224,224])
 
-# del model.fc                         # 删除最后的全连接层
-model.eval()
+# # del model.fc                         # 删除最后的全连接层
+# model.eval()
 
 def cache_model(support,query,model,mask_ratio=[0, 0.25, 0.5, 0.75],modal='mean'):
     
@@ -174,106 +180,292 @@ def catch_feature(query, model, mask_ratio=0):
 
     return feature[:,0,:],feature[:,1:,:]
 
-# ---------------------------------------------
-loss_fn = torch.nn.CrossEntropyLoss()
+class AverageMeter(object):
+	"""Computes and stores the average and current value"""
+	def __init__(self):
+		self.reset()
 
-epochs = 100
+	def reset(self):
+		self.val = 0
+		self.avg = 0
+		self.sum = 0
+		self.count = 0
 
-start = time.time()
+	def update(self, val, n=1):
+		self.val = val
+		self.sum += val * n
+		self.count += n
+		self.avg = self.sum / self.count
 
+def save_checkpoint(state, filename='checkpoint.pth.tar'):
+	torch.save(state, filename)
+        
+def train(train_loader,params,model,optimizer,loss_fn,epoch_index):
 
-log('==========start testing on train set===============')
-
-# for epoch in range(epochs):   
-    
-out_avg_loss = []
-timer = Timer()
+    batch_time = AverageMeter()
+    data_time = AverageMeter()
+    losses = AverageMeter()
+    top1 = AverageMeter()
+    end = time.time()
+    for episode_index, (temp2,target) in enumerate(train_loader):   
+    # temp2, _ =next(iter(train_loader))
+        
+        # Measure data loading time
+        data_time.update(time.time() - end)
                 
-avg_loss = 0
-total_correct = 0
-val_acc = []
-for idy, (temp2,target) in enumerate(train_loader):   
+        support,query = temp2.split([params.n_shot,params.n_query],dim=1)
+        cache_values, q_values = target.split([params.n_shot,params.n_query],dim=1)
+
+        # cache_values = F.one_hot(cache_values).half()
+        cache_values = cache_values.reshape(-1,cache_values.shape[-1])[:,0]
+        q_values = q_values.reshape(-1)
+        cache_values, q_values = cache_values.cuda(), q_values.cuda()
+
+        n,k,c,h,w = support.shape
+        support = support.reshape(-1,c,h,w)
+        support = support.cuda()
+        query = query.reshape(-1,c,h,w)
+        query = query.cuda()
+
+        # ---------图像组合--------------
+        
+        #--------方法1：将各自取50%，然后直接拼接-----------
+        query_patch = patchify(query)          # torch.Size([75, 196, 768])
+        support_patch = patchify(support)  
+        query_patch, _, _ = random_masking(query_patch)         # torch.Size([75, 98, 768])
+        support_patch, _, _ = random_masking(support_patch)
+        # print(query_patch.shape)
+        # print(support_patch.shape)
+        imags = torch.cat((query_patch.unsqueeze(1).repeat(1,5,1,1), support_patch.unsqueeze(0).repeat(75,1,1,1)), dim=2)
+        # print(imags.shape)
+        imags = imags.reshape(-1,imags.shape[2],imags.shape[3])
+        imags = unpatchify(imags)
+        print(imags.shape)
+        label = torch.eq(q_values.unsqueeze(1).repeat(1,5),cache_values.unsqueeze(0).repeat(75,1)).type(torch.float32)
+        label = label.reshape(-1)
+
+        outputs = model(imags)
+        outputs = F.sigmoid(outputs).reshape(-1)
+        loss = loss_fn(outputs,label)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        pred = outputs.reshape(-1,5).data.max(1)[1]
+        y = np.repeat(range(params.val_n_way),params.n_query)
+        y = torch.from_numpy(y)
+        y = y.cuda()
+        pred = pred.eq(y).sum()/query_patch.shape[0]
+
+        losses.update(loss.item(), query_patch.shape[0])
+        top1.update(pred, query_patch.shape[0])
+
+        # Measure elapsed time
+        batch_time.update(time.time() - end)
+        end = time.time()
+        
+        #============== print the intermediate results ==============#
+        if episode_index % params.print_freq == 0 and episode_index != 0:
+
+            log('Eposide-({0}): [{1}/{2}]\t'
+				'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+				'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
+				'Loss {loss.val:.3f} ({loss.avg:.3f})\t'
+				'Prec@1 {top1.val:.3f} ({top1.avg:.3f})'.format(
+					epoch_index, episode_index, len(train_loader), batch_time=batch_time, data_time=data_time, loss=losses, top1=top1))
+
+
+    return loss, pred
+    
+def validate(val_loader,params,model,epoch_index,best_prec1,loss_fn):
+    batch_time = AverageMeter()
+    losses = AverageMeter()
+    top1 = AverageMeter()
+  
+
+	# switch to evaluate mode
+    model.eval()
+    accuracies = []
+
+
+    end = time.time()
+    for episode_index, (temp2,target) in enumerate(val_loader):   
     # temp2, _ =next(iter(train_loader))
 
-    support,query = temp2.split([params.n_shot,params.n_query],dim=1)
-    cache_values, q_values = target.split([params.n_shot,params.n_query],dim=1)
+        support,query = temp2.split([params.n_shot,params.n_query],dim=1)
+        cache_values, q_values = target.split([params.n_shot,params.n_query],dim=1)
 
-    # cache_values = F.one_hot(cache_values).half()
-    cache_values = cache_values.reshape(-1,cache_values.shape[-1])[:,0]
-    q_values = q_values.reshape(-1)
-    cache_values, q_values = cache_values.cuda(), q_values.cuda()
+        # cache_values = F.one_hot(cache_values).half()
+        cache_values = cache_values.reshape(-1,cache_values.shape[-1])[:,0]
+        q_values = q_values.reshape(-1)
+        cache_values, q_values = cache_values.cuda(), q_values.cuda()
 
-    n,k,c,h,w = support.shape
-    support = support.reshape(-1,c,h,w)
-    support = support.cuda()
-    query = query.reshape(-1,c,h,w)
-    query = query.cuda()
+        n,k,c,h,w = support.shape
+        support = support.reshape(-1,c,h,w)
+        support = support.cuda()
+        query = query.reshape(-1,c,h,w)
+        query = query.cuda()
 
-    # -----------feature extractor------------------
-    mask_ratio=[0]       # 0,0.25,0.5,0.75
-    support_f , support_cls_token, query_f, query_cls_token = cache_model(support,query,model,mask_ratio=mask_ratio,modal='else')
+        # ---------图像组合--------------
+        
+        #--------方法1：将各自取50%，然后直接拼接-----------
+        query_patch = patchify(query)          # torch.Size([75, 196, 768])
+        support_patch = patchify(support)  
+        query_patch, _, _ = random_masking(query_patch)         # torch.Size([75, 98, 768])
+        support_patch, _, _ = random_masking(support_patch)
+        # print(query_patch.shape)
+        # print(support_patch.shape)
+        imags = torch.cat((query_patch.unsqueeze(1).repeat(1,5,1,1), support_patch.unsqueeze(0).repeat(75,1,1,1)), dim=2)
+        # print(imags.shape)
+        imags = imags.reshape(-1,imags.shape[2],imags.shape[3])
+        imags = unpatchify(imags)
+        print(imags.shape)
+        label = torch.eq(q_values.unsqueeze(1).repeat(1,5),cache_values.unsqueeze(0).repeat(75,1)).type(torch.float32)
+        label = label.reshape(-1)
 
-# ===============================================================================
-    cov_s = support_f @ support_f.transpose(2,1)      # 已经归一化了，得到的关系介于[-1,1]
-    sim = 0.5
-    # softmax = nn.Softmax(dim=-1)
-    # cov_s = softmax(cov_s)
-    # for i,v in enumerate(cov_s):
-    #     a = torch.nonzero(v>0.5)
-    cov_s_c = support_f @ support_cls_token.unsqueeze(2)          # cls 与 patch之间的关系
+        outputs = model(imags)
+        outputs = F.sigmoid(outputs).reshape(-1)
+        loss = loss_fn(outputs,label)
 
-    cov_q = query_f @ query_f.transpose(2,1)      # 已经归一化了，得到的关系介于[-1,1]
-    sim = 0.5
-    # softmax = nn.Softmax(dim=-1)
-    # cov_s = softmax(cov_s)
-    # for i,v in enumerate(cov_s):
-    #     a = torch.nonzero(v>0.5)
-    cov_q_c = query_f @ query_cls_token.unsqueeze(2)          # cls 与 patch之间的关系
+        pred = outputs.reshape(-1,5).data.max(1)[1]
+        y = np.repeat(range(params.val_n_way),params.n_query)
+        y = torch.from_numpy(y)
+        y = y.cuda()
+        pred = pred.eq(y).sum()
+        
+        losses.update(loss.item(), query_patch.size(0))
+        top1.update(pred, query_patch.size(0))
+        accuracies.append(pred)
+
+
+		# measure elapsed time
+        batch_time.update(time.time() - end)
+        end = time.time()
+        #============== print the intermediate results ==============#
+        if episode_index % parser.print_freq == 0 and episode_index != 0:
+
+            log('Test-({0}): [{1}/{2}]\t'
+				'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+				'Loss {loss.val:.3f} ({loss.avg:.3f})\t'
+				'Prec@1 {top1.val:.3f} ({top1.avg:.3f})'.format(
+					epoch_index, episode_index, len(val_loader), batch_time=batch_time, loss=losses, top1=top1))
+	
+        log(' * Prec@1 {top1.avg:.3f} Best_prec1 {best_prec1:.3f}'.format(top1=top1, best_prec1=best_prec1))
+
+        return top1.avg, accuracies
+
     
-#---------------query cls 和 support cls的关系-------------
-    cov_cls = query_cls_token @ support_cls_token.t()                              
-#---------------query map 和 support cls的关系-------------
-    cov_qs = query_f.unsqueeze(1).repeat(1,5,1,1) @ support_cls_token.unsqueeze(2).unsqueeze(0).repeat(75,1,1,1)                     #  [75,196,768]  [5,768]
-    # cov_qs = cov_qs.squeeze(3).sum(-1)
-    cov_qs = cov_qs.squeeze(3)
-    neighbor_k = 10
-    topk_value, topk_index = torch.topk(cov_qs, neighbor_k, 2)
-    cov_qs = topk_value.sum(-1)
-#---------------support map 和 query cls的关系-------------
-    cov_sq = query_cls_token.unsqueeze(1).unsqueeze(1).repeat(1,5,1,1) @ support_f.unsqueeze(0).repeat(75,1,1,1).transpose(3,2)                #[75,768]     [5,196,768]
-    # cov_sq = cov_sq.squeeze(2).sum(-1)
-    cov_sq = cov_sq.squeeze(2)
-    neighbor_k = 10
-    topk_value, topk_index = torch.topk(cov_sq, neighbor_k, 2)
-    cov_sq = topk_value.sum(-1)
-# ===========================直接采用linear layer ================================
-    y = np.repeat(range(params.val_n_way),params.n_query)
-    y = torch.from_numpy(y)
-    y = y.cuda()
-    # metric_cos = affinity.reshape(-1,n,k).mean(dim=-1)           # 直接度量
-    # support_f = support_f.reshape(n,k,-1).mean(dim=1)
-    # support_cls_token = support_cls_token.reshape(n,k,-1).mean(dim=1)
+
+
+def main():
+    model = models_vit.__dict__[params.model](
+        num_classes=1,
+        global_pool=params.global_pool,
+    )
+
+
+    checkpoint = torch.load('/home/jiangweihao/CodeLab/PytorchCode/mae_fsl/checkpoint/mae_pretrain_vit_base.pth')
+
+
+    checkpoint_model = checkpoint['model']
+    state_dict = model.state_dict()
+    for k in ['head.weight', 'head.bias']:
+        if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
+            print(f"Removing key {k} from pretrained checkpoint")
+            del checkpoint_model[k]
+
+    # interpolate position embedding
+    # interpolate_pos_embed(model, checkpoint_model)
+
+    # load pre-trained model
+    msg = model.load_state_dict(checkpoint_model, strict=False)
+    print(msg)
+
+    if params.global_pool:
+        assert set(msg.missing_keys) == {'head.weight', 'head.bias', 'fc_norm.weight', 'fc_norm.bias'}
+    else:
+        assert set(msg.missing_keys) == {'head.weight', 'head.bias'}
+
+    # manually initialize fc layer: following MoCo v3
+    trunc_normal_(model.head.weight, std=0.01)
+
+    # for linear prob only
+    # hack: revise model's head with BN
+    model.head = torch.nn.Sequential(torch.nn.BatchNorm1d(model.head.in_features, affine=False, eps=1e-6), model.head)
+    # freeze all but the head
+    for _, p in model.named_parameters():
+        p.requires_grad = False
+    for _, p in model.head.named_parameters():
+        p.requires_grad = True
+
+    model.to('cuda')
+    # ---------------------------------------------
+    loss_fn = torch.nn.MSELoss()
+
+    optimizer = torch.optim.SGD([p for p in model.parameters() if p.requires_grad], lr = 0.01, momentum=params.momentum, weight_decay=params.weight_decay)                
+
+    schedule = torch.optim.lr_scheduler.MultiStepLR(optimizer,milestones=[30, 60],gamma=0.1)     #[30,60]
+    epochs = 100
+    log('==========start training on train set===============')
     
-    # metric_cos = query_f @ support_f.t()
-    # metric_cos2 = query_cls_token @ support_cls_token.t()
-    # # metric_cos += metric_cos2
+    loss_all = []
+    pred_all = []
+    best_prec1 = 0
+    for epoch in range(epochs): 
+        log('==========start training===============')
+        epoch_learning_rate = 0.1
+        for param_group in optimizer.param_groups:
+            epoch_learning_rate = param_group['lr']
+            
+        log( 'Train Epoch: {}\tLearning Rate: {:.4f}'.format(
+                            epoch, epoch_learning_rate))
+        loss,pred = train(train_loader,params,model,optimizer,loss_fn,epoch)
 
-    metric_cos = cov_qs + cov_sq
-    pred = metric_cos.data.max(1)[1]
-    cos_acc = pred.eq(y).sum()/(params.train_n_way*params.n_query)
-    total_correct += pred.eq(y).sum()
-    
-val_acc_ci95 = 1.96 * np.std(np.array(val_acc)) / np.sqrt(params.val_n_episode)
-val_acc = np.mean(val_acc) * 100
+        loss_all.append(loss.item())
+        pred_all.append(pred.item())
 
-cos_acc = total_correct/len(train_loader)/(params.train_n_way*params.n_query) * 100
+        schedule.step()
 
-log('test size:%d , test_acc:%.2f ± %.2f %% '%(len(train_loader), val_acc, val_acc_ci95))
-log('cos acc: %.2f %% '%(cos_acc))
-log('test epoch time: {:.2f}'.format(timer.t()))
+        log('============ Validation on the val set ============')
+        
+        if epoch % 10 == 0:
+            prec1, _ = validate(train_loader,params,model,epoch,best_prec1,loss_fn)
+        
+        	# record the best prec@1 and save checkpoint
+        is_best = prec1 > best_prec1
+        best_prec1 = max(prec1, best_prec1)
 
-log(time.time()-start)
-log('===========================training end!===================================')
+        # save the checkpoint
+        if is_best:
+            save_checkpoint(
+                {
+                    'epoch_index': epoch,
+                    'arch': 'opt.basemodel',
+                    'state_dict': model.state_dict(),
+                    'best_prec1': best_prec1,
+                    'optimizer' : optimizer.state_dict(),
+                }, os.path.join(log_path, 'model_best.pth.tar'))
+
+
+        if epoch % 10 == 0:
+            filename = os.path.join(log_path, 'epoch_%d.pth.tar' %epoch)
+            save_checkpoint(
+            {
+                'epoch_index': epoch,
+                'arch': "opt.basemodel",
+                'state_dict': model.state_dict(),
+                'best_prec1': best_prec1,
+                'optimizer' : optimizer.state_dict(),
+            }, filename)
+
+
+if __name__ == '__main__':
+
+    start = time.time()
+    main()
+    log(time.time()-start)
+    log('===========================training end!===================================')
 
 
 

@@ -9,6 +9,8 @@ import torch.nn.functional as F
 from torch.optim import SGD, Adam
 from torch.optim.lr_scheduler import MultiStepLR
 import tqdm
+import scipy as sp
+import scipy.stats
 
 _log_path = None
 
@@ -351,3 +353,10 @@ def random_compose(x, y, mask_ratio=0.5):
     x = x + y
 
     return x
+
+def mean_confidence_interval(data, confidence=0.95):
+    a = 1.0*np.array(data)
+    n = len(a)
+    m, se = np.mean(a), scipy.stats.sem(a)
+    h = se * sp.stats.t._ppf((1+confidence)/2., n-1)
+    return m,h

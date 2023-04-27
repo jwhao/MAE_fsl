@@ -14,10 +14,10 @@ warnings.filterwarnings('ignore')
 # fix seed
 np.random.seed(1)
 torch.manual_seed(1)
-import tqdm
+from tqdm import tqdm
 from torch.nn.parallel import DataParallel
 # torch.backends.cudnn.benchmark = True
-from models.models_mae import mae_vit_base_patch16
+from models.models_mae import mae_vit_base_patch16, mae_vit_large_patch16
 # from sklearn import svm     #导入算法模块
 
 #--------------参数设置--------------------
@@ -28,11 +28,11 @@ parser.add_argument('--image_size', default=224, type=int, choices=[84, 224], he
 parser.add_argument('--dataset', default='mini_imagenet', choices=['mini_imagenet','tiered_imagenet','cub'])
 parser.add_argument('--data_path', default='/home/jiangweihao/data/mini-imagenet/',type=str, help='dataset path')
 
-parser.add_argument('--train_n_episode', default=300, type=int, help='number of episodes in meta train')
+parser.add_argument('--train_n_episode', default=1000, type=int, help='number of episodes in meta train')
 parser.add_argument('--val_n_episode', default=300, type=int, help='number of episodes in meta val')
 parser.add_argument('--train_n_way', default=5, type=int, help='number of classes used for meta train')
 parser.add_argument('--val_n_way', default=5, type=int, help='number of classes used for meta val')
-parser.add_argument('--n_shot', default=1, type=int, help='number of labeled data in each class, same as n_support')
+parser.add_argument('--n_shot', default=5, type=int, help='number of labeled data in each class, same as n_support')
 parser.add_argument('--n_query', default=15, type=int, help='number of unlabeled data in each class')
 parser.add_argument('--num_classes', default=64, type=int, help='total number of classes in pretrain')
 
@@ -42,15 +42,16 @@ parser.add_argument('--freq', default=10, type=int, help='total number of inner 
 parser.add_argument('--momentum', default=0.9, type=int, help='parameter of optimization')
 parser.add_argument('--weight_decay', default=5.e-4, type=int, help='parameter of optimization')
 
-parser.add_argument('--gpu', default='7')
+parser.add_argument('--gpu', default='5')
 parser.add_argument('--epochs', default=100)
-parser.add_argument('--mask_ratio', default=0)
+parser.add_argument('--mask_ratio', default=0.0, type=float, nargs='+')  # ,type=float  nargs='+'
 
+parser.add_argument('--model', default='base',choices=['base', 'large'])
 params = parser.parse_args()
 
 # 设置日志记录路径
 log_path = os.path.dirname(os.path.abspath(__file__))
-log_path = os.path.join(log_path,'save/{}_{}_{}_mae_kmeans'.format(params.dataset,params.train_n_episode,params.n_shot))
+log_path = os.path.join(log_path,'save/{}_task-{}_shot-{}_mask-{}mae_similarity_model-{}-large'.format(params.dataset,params.train_n_episode,params.n_shot,params.mask_ratio,params.model))
 ensure_path(log_path)
 set_log_path(log_path)
 log('log and pth save path:  %s'%(log_path))
@@ -108,17 +109,25 @@ val_loader = val_datamgr.get_data_loader(val_file, aug=False)
 # print(label2.size())
 
 # ----------- 导入模型 -------------------------
-model = mae_vit_base_patch16()
+
+model_base = mae_vit_base_patch16()
 state_dict = torch.load('/home/jiangweihao/code/MAE_fsl/mae_pretrain_vit_base.pth')
 state_dict = state_dict['model']
-model.load_state_dict(state_dict,strict=False)  # 
-model.cuda()
+model_base.load_state_dict(state_dict,strict=False)  # 
+model_base.cuda()
+
+model_large = mae_vit_large_patch16()
+state_dict = torch.load('/home/jiangweihao/code/MAE_fsl/mae_pretrain_vit_large.pth')
+state_dict = state_dict['model']
+model_large.load_state_dict(state_dict,strict=False)  # 
+model_large.cuda()
 
 # from torchinfo import summary
 # summary(model,[5,3,224,224])
 
-# del model.fc                         # 删除最后的全连接层
-model.eval()
+# del model.fc                         
+model_base.eval()                 # 根据mae_similarity实验结果，model_base 的mask取0.5，取cls和patch的联合结果更好
+model_large.eval()                # model_large的mask取0.75，取cls效果更好；
 
 def cache_model(support,query,model,mask_ratio=[0, 0.25, 0.5, 0.75],modal='mean'):
     
@@ -192,8 +201,12 @@ timer = Timer()
                 
 avg_loss = 0
 total_correct = 0
-val_acc = []
-for idy, (temp2,target) in enumerate(train_loader):   
+cls_correct = 0
+patch_correct = 0
+val_acc_total = []
+val_acc_cls = []
+val_acc_patch = []
+for idy, (temp2,target) in enumerate(tqdm(train_loader)):   
     # temp2, _ =next(iter(train_loader))
 
     support,query = temp2.split([params.n_shot,params.n_query],dim=1)
@@ -211,65 +224,76 @@ for idy, (temp2,target) in enumerate(train_loader):
     query = query.cuda()
 
     # -----------feature extractor------------------
-    mask_ratio=[0]       # 0,0.25,0.5,0.75
-    support_f , support_cls_token, query_f, query_cls_token = cache_model(support,query,model,mask_ratio=mask_ratio,modal='else')
+    # mask_ratio=[0.25]       # 0,0.25,0.5,0.75
+    # mask_ratio = [params.mask_ratio]
+    mask_ratio = params.mask_ratio          #[0.75]
+    support_f , support_cls_token, query_f, query_cls_token = cache_model(support,query,model_base,mask_ratio=mask_ratio,modal='else')
+
+    support_f_l , support_cls_token_l, query_f_l, query_cls_token_l = cache_model(support,query,model_large,mask_ratio=mask_ratio,modal='else')
 
 # ===============================================================================
-    cov_s = support_f @ support_f.transpose(2,1)      # 已经归一化了，得到的关系介于[-1,1]
-    sim = 0.5
-    # softmax = nn.Softmax(dim=-1)
-    # cov_s = softmax(cov_s)
-    # for i,v in enumerate(cov_s):
-    #     a = torch.nonzero(v>0.5)
-    cov_s_c = support_f @ support_cls_token.unsqueeze(2)          # cls 与 patch之间的关系
+ 
+#--base---------------query cls 和 support cls的关系-------------
+    cov_cls = query_cls_token @ support_cls_token.t()
+    cov_cls = cov_cls.reshape(-1,params.val_n_way,params.n_shot).sum(-1)
 
-    cov_q = query_f @ query_f.transpose(2,1)      # 已经归一化了，得到的关系介于[-1,1]
-    sim = 0.5
-    # softmax = nn.Softmax(dim=-1)
-    # cov_s = softmax(cov_s)
-    # for i,v in enumerate(cov_s):
-    #     a = torch.nonzero(v>0.5)
-    cov_q_c = query_f @ query_cls_token.unsqueeze(2)          # cls 与 patch之间的关系
-    
-#---------------query cls 和 support cls的关系-------------
-    cov_cls = query_cls_token @ support_cls_token.t()                              
-#---------------query map 和 support cls的关系-------------
-    cov_qs = query_f.unsqueeze(1).repeat(1,5,1,1) @ support_cls_token.unsqueeze(2).unsqueeze(0).repeat(75,1,1,1)                     #  [75,196,768]  [5,768]
-    # cov_qs = cov_qs.squeeze(3).sum(-1)
-    cov_qs = cov_qs.squeeze(3)
-    neighbor_k = 10
-    topk_value, topk_index = torch.topk(cov_qs, neighbor_k, 2)
-    cov_qs = topk_value.sum(-1)
-#---------------support map 和 query cls的关系-------------
-    cov_sq = query_cls_token.unsqueeze(1).unsqueeze(1).repeat(1,5,1,1) @ support_f.unsqueeze(0).repeat(75,1,1,1).transpose(3,2)                #[75,768]     [5,196,768]
-    # cov_sq = cov_sq.squeeze(2).sum(-1)
-    cov_sq = cov_sq.squeeze(2)
-    neighbor_k = 10
-    topk_value, topk_index = torch.topk(cov_sq, neighbor_k, 2)
-    cov_sq = topk_value.sum(-1)
-# ===========================直接采用linear layer ================================
+#--large---------------query cls 和 support cls的关系-------------
+    cov_cls_l = query_cls_token_l @ support_cls_token_l.t()
+    cov_cls_l = cov_cls_l.reshape(-1,params.val_n_way,params.n_shot).sum(-1)
+
+#--base---------------query map 和 support map的关系-------------
+    query_f = query_f.mean(dim=1)
+    support_f = support_f.mean(dim=1)
+    cov_patch = query_f @ support_f.t()
+    cov_patch = cov_patch.reshape(-1,params.val_n_way,params.n_shot).sum(-1)
+
+# ===========================计算准确率 ================================
     y = np.repeat(range(params.val_n_way),params.n_query)
     y = torch.from_numpy(y)
     y = y.cuda()
-    # metric_cos = affinity.reshape(-1,n,k).mean(dim=-1)           # 直接度量
-    # support_f = support_f.reshape(n,k,-1).mean(dim=1)
-    # support_cls_token = support_cls_token.reshape(n,k,-1).mean(dim=1)
     
-    # metric_cos = query_f @ support_f.t()
-    # metric_cos2 = query_cls_token @ support_cls_token.t()
-    # # metric_cos += metric_cos2
+    # #---------cls acc----------------
+    # metric_cos = cov_cls
+    # pred = metric_cos.data.max(1)[1]
+    # cos_acc = pred.eq(y).sum()/(params.train_n_way*params.n_query)
+    # cls_correct += pred.eq(y).sum()
+    # val_acc_cls.append(cos_acc.item())
 
-    metric_cos = cov_qs + cov_sq
+    # #---------patch(mean)  acc-------
+    # metric_cos = cov_patch
+    # pred = metric_cos.data.max(1)[1]
+    # cos_acc = pred.eq(y).sum()/(params.train_n_way*params.n_query)
+    # patch_correct += pred.eq(y).sum()
+    # val_acc_patch.append(cos_acc.item())
+
+    #--------cls + patch(mean) acc---+ large cls------
+    # metric_cos = cov_cls + cov_patch + cov_cls_l
+    metric_cos = cov_cls_l
     pred = metric_cos.data.max(1)[1]
     cos_acc = pred.eq(y).sum()/(params.train_n_way*params.n_query)
     total_correct += pred.eq(y).sum()
-    
-val_acc_ci95 = 1.96 * np.std(np.array(val_acc)) / np.sqrt(params.val_n_episode)
-val_acc = np.mean(val_acc) * 100
+    val_acc_total.append(cos_acc.item())
+
+
+# # ------------------cls---------------------
+# val_acc_ci95 = 1.96 * np.std(np.array(val_acc_cls)) / np.sqrt(params.val_n_episode)
+# val_acc = np.mean(val_acc_cls) * 100
+
+# log('test size:%d , cls_test_acc:%.2f ± %.2f %% '%(len(train_loader), val_acc, val_acc_ci95))
+
+# # ------------------patch(mean)-------------
+# val_acc_ci95 = 1.96 * np.std(np.array(val_acc_patch)) / np.sqrt(params.val_n_episode)
+# val_acc = np.mean(val_acc_patch) * 100
+
+# log('test size:%d , patch_test_acc:%.2f ± %.2f %% '%(len(train_loader), val_acc, val_acc_ci95))
+
+# ----------------cls + patch(mean)---------large cls---
+val_acc_ci95 = 1.96 * np.std(np.array(val_acc_total)) / np.sqrt(params.val_n_episode)
+val_acc = np.mean(val_acc_total) * 100
 
 cos_acc = total_correct/len(train_loader)/(params.train_n_way*params.n_query) * 100
 
-log('test size:%d , test_acc:%.2f ± %.2f %% '%(len(train_loader), val_acc, val_acc_ci95))
+log('test size:%d , cls-patch_test_acc:%.2f ± %.2f %% '%(len(train_loader), val_acc, val_acc_ci95))
 log('cos acc: %.2f %% '%(cos_acc))
 log('test epoch time: {:.2f}'.format(timer.t()))
 

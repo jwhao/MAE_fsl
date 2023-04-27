@@ -24,6 +24,9 @@ import timm
 # assert timm.__version__ == "0.3.2" # version check
 from timm.models.layers import trunc_normal_
 from models import models_vit
+
+import scipy as sp
+import scipy.stats
 #--------------参数设置--------------------
 import argparse
 
@@ -32,7 +35,7 @@ parser.add_argument('--image_size', default=224, type=int, choices=[84, 224], he
 parser.add_argument('--dataset', default='mini_imagenet', choices=['mini_imagenet','tiered_imagenet','cub'])
 parser.add_argument('--data_path', default='/home/jiangweihao/data/mini-imagenet/',type=str, help='dataset path')
 
-parser.add_argument('--train_n_episode', default=300, type=int, help='number of episodes in meta train')
+parser.add_argument('--train_n_episode', default=600, type=int, help='number of episodes in meta train')
 parser.add_argument('--val_n_episode', default=300, type=int, help='number of episodes in meta val')
 parser.add_argument('--train_n_way', default=5, type=int, help='number of classes used for meta train')
 parser.add_argument('--val_n_way', default=5, type=int, help='number of classes used for meta val')
@@ -55,7 +58,7 @@ params = parser.parse_args()
 
 # 设置日志记录路径
 log_path = os.path.dirname(os.path.abspath(__file__))
-log_path = os.path.join(log_path,'save/{}_{}_{}_mae_image_compose'.format(params.dataset,params.train_n_episode,params.n_shot))
+log_path = os.path.join(log_path,'save/{}_train_task-{}_shot-{}_mae_image_compose'.format(params.dataset,params.train_n_episode,params.n_shot))
 ensure_path(log_path)
 set_log_path(log_path)
 log('log and pth save path:  %s'%(log_path))
@@ -199,7 +202,14 @@ class AverageMeter(object):
 
 def save_checkpoint(state, filename='checkpoint.pth.tar'):
 	torch.save(state, filename)
-        
+
+def mean_confidence_interval(data, confidence=0.95):
+	a = [1.0*np.array(data[i].cpu()) for i in range(len(data))]
+	n = len(a)
+	m, se = np.mean(a), scipy.stats.sem(a)
+	h = se * sp.stats.t._ppf((1+confidence)/2., n-1)
+	return m,h
+       
 def train(train_loader,params,model,optimizer,loss_fn,epoch_index):
 
     batch_time = AverageMeter()
@@ -236,12 +246,21 @@ def train(train_loader,params,model,optimizer,loss_fn,epoch_index):
         support_patch, _, _ = random_masking(support_patch)
         # print(query_patch.shape)
         # print(support_patch.shape)
+<<<<<<< HEAD
         imags = torch.cat((query_patch.unsqueeze(1).repeat(1,params.n_shot*params.train_n_way,1,1), support_patch.unsqueeze(0).repeat(params.n_query*params.train_n_way,1,1,1)), dim=2)
         # print(imags.shape)
         imags = imags.reshape(-1,imags.shape[2],imags.shape[3])
         imags = unpatchify(imags)
         print(imags.shape)
         label = torch.eq(q_values.unsqueeze(1).repeat(1,params.n_shot*params.train_n_way),cache_values.unsqueeze(0).repeat(params.n_query*params.train_n_way,1)).type(torch.float32)
+=======
+        imags = torch.cat((query_patch.unsqueeze(1).repeat(1,params.train_n_way*params.n_shot,1,1), support_patch.unsqueeze(0).repeat(params.train_n_way*params.n_query,1,1,1)), dim=2)
+        # print(imags.shape)
+        imags = imags.reshape(-1,imags.shape[2],imags.shape[3])
+        imags = unpatchify(imags)
+        # print(imags.shape)
+        label = torch.eq(q_values.unsqueeze(1).repeat(1,params.train_n_way*params.n_shot),cache_values.unsqueeze(0).repeat(params.train_n_way*params.n_query,1)).type(torch.float32)
+>>>>>>> c32fa1de4f92349cfc8404ecfdf289b779070b3f
         label = label.reshape(-1)
 
         outputs = model(imags)
@@ -252,7 +271,12 @@ def train(train_loader,params,model,optimizer,loss_fn,epoch_index):
         loss.backward()
         optimizer.step()
 
+<<<<<<< HEAD
         pred = outputs.reshape(-1,params.n_shot*params.train_n_way).data.max(1)[1]
+=======
+        # pred = outputs.reshape(-1,params.train_n_way*params.n_shot).data.max(1)[1]
+        pred = outputs.reshape(-1,params.train_n_way,params.n_shot).sum(-1).data.max(1)[1]
+>>>>>>> c32fa1de4f92349cfc8404ecfdf289b779070b3f
         y = np.repeat(range(params.val_n_way),params.n_query)
         y = torch.from_numpy(y)
         y = y.cuda()
@@ -316,23 +340,36 @@ def validate(val_loader,params,model,epoch_index,best_prec1,loss_fn):
         support_patch, _, _ = random_masking(support_patch)
         # print(query_patch.shape)
         # print(support_patch.shape)
+<<<<<<< HEAD
         imags = torch.cat((query_patch.unsqueeze(1).repeat(1,params.n_shot*params.train_n_way,1,1), support_patch.unsqueeze(0).repeat(params.train_n_way*params.n_query,1,1,1)), dim=2)
         # print(imags.shape)
         imags = imags.reshape(-1,imags.shape[2],imags.shape[3])
         imags = unpatchify(imags)
         print(imags.shape)
         label = torch.eq(q_values.unsqueeze(1).repeat(1,params.n_shot*params.train_n_way),cache_values.unsqueeze(0).repeat(params.train_n_way*params.n_query,1)).type(torch.float32)
+=======
+        imags = torch.cat((query_patch.unsqueeze(1).repeat(1,params.train_n_way*params.n_shot,1,1), support_patch.unsqueeze(0).repeat(params.train_n_way*params.n_query,1,1,1)), dim=2)
+        # print(imags.shape)
+        imags = imags.reshape(-1,imags.shape[2],imags.shape[3])
+        imags = unpatchify(imags)
+        # print(imags.shape)
+        label = torch.eq(q_values.unsqueeze(1).repeat(1,params.train_n_way*params.n_shot),cache_values.unsqueeze(0).repeat(params.train_n_way*params.n_query,1)).type(torch.float32)
+>>>>>>> c32fa1de4f92349cfc8404ecfdf289b779070b3f
         label = label.reshape(-1)
 
         outputs = model(imags)
         outputs = F.sigmoid(outputs).reshape(-1)
         loss = loss_fn(outputs,label)
 
+<<<<<<< HEAD
         pred = outputs.reshape(-1,params.n_shot*params.train_n_way).data.max(1)[1]
+=======
+        pred = outputs.reshape(-1,params.train_n_way,params.n_shot).sum(-1).data.max(1)[1]
+>>>>>>> c32fa1de4f92349cfc8404ecfdf289b779070b3f
         y = np.repeat(range(params.val_n_way),params.n_query)
         y = torch.from_numpy(y)
         y = y.cuda()
-        pred = pred.eq(y).sum()
+        pred = pred.eq(y).sum()/query_patch.shape[0]
         
         losses.update(loss.item(), query_patch.size(0))
         top1.update(pred, query_patch.size(0))
@@ -342,6 +379,8 @@ def validate(val_loader,params,model,epoch_index,best_prec1,loss_fn):
 		# measure elapsed time
         batch_time.update(time.time() - end)
         end = time.time()
+
+        best_prec1 = max(best_prec1,top1.val)
         #============== print the intermediate results ==============#
         if episode_index % params.print_freq == 0 and episode_index != 0:
 
@@ -351,9 +390,9 @@ def validate(val_loader,params,model,epoch_index,best_prec1,loss_fn):
 				'Prec@1 {top1.val:.3f} ({top1.avg:.3f})'.format(
 					epoch_index, episode_index, len(val_loader), batch_time=batch_time, loss=losses, top1=top1))
 	
-        log(' * Prec@1 {top1.avg:.3f} Best_prec1 {best_prec1:.3f}'.format(top1=top1, best_prec1=best_prec1))
+        # log(' * Prec@1 {top1.avg:.3f} Best_prec1 {best_prec1:.3f}'.format(top1=top1, best_prec1=best_prec1))
 
-        return top1.avg, accuracies
+    return top1.avg, accuracies
 
     
 
@@ -407,13 +446,21 @@ def main():
 
     schedule = torch.optim.lr_scheduler.MultiStepLR(optimizer,milestones=[30, 60],gamma=0.1)     #[30,60]
     epochs = 100
+<<<<<<< HEAD
     log('==============start training ===============')
+=======
+    log('==========start training ===============')
+>>>>>>> c32fa1de4f92349cfc8404ecfdf289b779070b3f
     
     loss_all = []
     pred_all = []
     best_prec1 = 0
     for epoch in range(epochs): 
+<<<<<<< HEAD
         log('=========== Training on train set===============')
+=======
+        log('==========training on train set===============')
+>>>>>>> c32fa1de4f92349cfc8404ecfdf289b779070b3f
         epoch_learning_rate = 0.1
         for param_group in optimizer.param_groups:
             epoch_learning_rate = param_group['lr']
@@ -427,9 +474,8 @@ def main():
 
         schedule.step()
 
-        log('============ Validation on the val set ============')
-        
         if epoch % 10 == 0:
+            log('============ Validation on the val set ============')
             prec1, _ = validate(train_loader,params,model,epoch,best_prec1,loss_fn)
         
         	# record the best prec@1 and save checkpoint

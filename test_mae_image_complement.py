@@ -55,12 +55,13 @@ parser.add_argument('--gpu', default='1')
 parser.add_argument('--epochs', default=100)
 
 parser.add_argument('--mlp', action='store_true')
+parser.add_argument('--ft', action='store_true')
 
 params = parser.parse_args()
 
 # 设置日志记录路径
 log_path = os.path.dirname(os.path.abspath(__file__))
-log_path = os.path.join(log_path,'save/{}_test_task-{}_shot-{}_mae_image_compose_mlp[{}]'.format(params.dataset,params.test_n_episode,params.n_shot,params.mlp))
+log_path = os.path.join(log_path,'save/{}_test_task-{}_shot-{}_mae_image_complement_mlp[{}]_ft[{}]'.format(params.dataset,params.test_n_episode,params.n_shot,params.mlp,params.ft))
 ensure_path(log_path)
 set_log_path(log_path)
 log('log and pth save path:  %s'%(log_path))
@@ -225,15 +226,11 @@ def test(test_loader,params,model,epoch_index,best_prec1,loss_fn):
 
         # ---------图像组合--------------
         
-        #--------方法1：将各自取50%，然后直接拼接-----------
+        #--------方法2：将support取50%，query填充其掩码部分，互补拼接-----------
         query_patch = patchify(query)          # torch.Size([75, 196, 768])
         support_patch = patchify(support)  
-        query_patch, _, _ = random_masking(query_patch)         # torch.Size([75, 98, 768])
-        support_patch, _, _ = random_masking(support_patch)
-        # print(query_patch.shape)
-        # print(support_patch.shape)
-        imags = torch.cat((query_patch.unsqueeze(1).repeat(1,params.val_n_way*params.n_shot,1,1), support_patch.unsqueeze(0).repeat(params.val_n_way*params.n_query,1,1,1)), dim=2)
-        # print(imags.shape)
+        imags = random_compose(query_patch,support_patch)
+
         imags = imags.reshape(-1,imags.shape[2],imags.shape[3])
         imags = unpatchify(imags)
         # print(imags.shape)
@@ -277,21 +274,30 @@ def test(test_loader,params,model,epoch_index,best_prec1,loss_fn):
 
 
 def main():
+
     model = models_vit.__dict__[params.model](
-        num_classes=1,
+        num_classes=1 if not params.mlp else 256,
         global_pool=params.global_pool,
     )
-    
+
+
+    # checkpoint = torch.load('/home/jiangweihao/CodeLab/PytorchCode/MAE_fsl/save/mini_imagenet_train_task-600_shot-5_mae_image_compolement/model_best.pth.tar')
+    # model.head = torch.nn.Sequential(torch.nn.BatchNorm1d(model.head.in_features, affine=False, eps=1e-6), model.head)
+
     if not params.mlp:
-        checkpoint = torch.load('/home/jiangweihao/CodeLab/PytorchCode/MAE_fsl/save/mini_imagenet_300_1_mae_image_compose/model_best.pth.tar')
+        checkpoint = torch.load('/home/jiangweihao/CodeLab/PytorchCode/MAE_fsl/save/mini_imagenet_train_task-600_shot-5_mae_image_compolement/model_best.pth.tar')
         model.head = torch.nn.Sequential(torch.nn.BatchNorm1d(model.head.in_features, affine=False, eps=1e-6), model.head)
+        if params.ft:
+            checkpoint = torch.load('/home/jiangweihao/CodeLab/PytorchCode/MAE_fsl/save/mini_imagenet_train_task-600_shot-5_mae_image_compolement_FT[True]/model_best.pth.tar')  
+            # model.head = torch.nn.Sequential(torch.nn.BatchNorm1d(model.head.in_features, affine=False, eps=1e-6), model.head)
     else:
-        checkpoint = torch.load('/home/jiangweihao/CodeLab/PytorchCode/MAE_fsl/save/mini_imagenet_train_task-600_shot-5_mae_image_compose_mlp/model_best.pth.tar')
+        checkpoint = torch.load('/home/jiangweihao/CodeLab/PytorchCode/MAE_fsl/save/mini_imagenet_train_task-600_shot-5_mae_image_compolement_mlp/model_best.pth.tar')
         model.head = torch.nn.Sequential(torch.nn.BatchNorm1d(model.head.in_features, affine=False, eps=1e-6), 
-                                     model.head,
-                                     torch.nn.ReLU(),
-                                     torch.nn.Linear(256,1)
-                                     )               # 768 -> 256 -> 1
+                                    model.head,
+                                    torch.nn.ReLU(),
+                                    torch.nn.Linear(256,1)
+                                    )               # 768 -> 256 -> 1
+
     model.load_state_dict(checkpoint['state_dict'], strict=True)
     model.to('cuda')
     # ---------------------------------------------

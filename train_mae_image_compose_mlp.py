@@ -36,11 +36,11 @@ parser.add_argument('--dataset', default='mini_imagenet', choices=['mini_imagene
 parser.add_argument('--data_path', default='/home/jiangweihao/CodeLab/data/mini-imagenet/',type=str, help='dataset path')
 
 parser.add_argument('--train_n_episode', default=600, type=int, help='number of episodes in meta train')
-parser.add_argument('--test_n_episode', default=1000, type=int, help='number of episodes in meta val')
+parser.add_argument('--val_n_episode', default=300, type=int, help='number of episodes in meta val')
 parser.add_argument('--train_n_way', default=5, type=int, help='number of classes used for meta train')
 parser.add_argument('--val_n_way', default=5, type=int, help='number of classes used for meta val')
 parser.add_argument('--n_shot', default=5, type=int, help='number of labeled data in each class, same as n_support')
-parser.add_argument('--n_query', default=1, type=int, help='number of unlabeled data in each class')
+parser.add_argument('--n_query', default=5, type=int, help='number of unlabeled data in each class')
 parser.add_argument('--num_classes', default=64, type=int, help='total number of classes in pretrain')
 parser.add_argument('--model', default='vit_base_patch16', type=str, metavar='MODEL',
                         help='Name of model to train')
@@ -51,16 +51,14 @@ parser.add_argument('--print_freq', default=10, type=int, help='total number of 
 parser.add_argument('--momentum', default=0.9, type=int, help='parameter of optimization')
 parser.add_argument('--weight_decay', default=5.e-4, type=int, help='parameter of optimization')
 
-parser.add_argument('--gpu', default='1')
+parser.add_argument('--gpu', default='0')
 parser.add_argument('--epochs', default=100)
-
-parser.add_argument('--mlp', action='store_true')
 
 params = parser.parse_args()
 
 # 设置日志记录路径
 log_path = os.path.dirname(os.path.abspath(__file__))
-log_path = os.path.join(log_path,'save/{}_test_task-{}_shot-{}_mae_image_compose_mlp[{}]'.format(params.dataset,params.test_n_episode,params.n_shot,params.mlp))
+log_path = os.path.join(log_path,'save/{}_train_task-{}_shot-{}_mae_image_compose_mlp'.format(params.dataset,params.train_n_episode,params.n_shot))
 ensure_path(log_path)
 set_log_path(log_path)
 log('log and pth save path:  %s'%(log_path))
@@ -87,12 +85,19 @@ elif params.dataset == 'tiered_imagenet':
 else:
     ValueError('dataset error')
 
-#------------ test data ------------------------
-test_file = 'test'
-json_file_read = False
+# -----------  base data ----------------------
+base_datamgr = SimpleDataManager(params.data_path, params.image_size, batch_size=params.batch_size, json_read=json_file_read)
+base_loader = base_datamgr.get_data_loader(base_file, aug=True)
+
+#-----------  train data ----------------------
+train_few_shot_params = dict(n_way=params.train_n_way, n_support=params.n_shot)
+train_datamgr = SetDataManager(params.data_path, params.image_size, n_query=params.n_query, n_episode=params.train_n_episode, json_read=json_file_read, **train_few_shot_params)
+train_loader = train_datamgr.get_data_loader(base_file, aug=True)
+
+#------------ val data ------------------------
 test_few_shot_params = dict(n_way=params.val_n_way, n_support=params.n_shot)
-test_datamgr = SetDataManager(params.data_path, params.image_size, n_query=params.n_query, n_episode=params.test_n_episode, json_read=json_file_read, **test_few_shot_params)
-test_loader = test_datamgr.get_data_loader(test_file, aug=False)
+val_datamgr = SetDataManager(params.data_path, params.image_size, n_query=params.n_query, n_episode=params.val_n_episode, json_read=json_file_read, **test_few_shot_params)
+val_loader = val_datamgr.get_data_loader(val_file, aug=False)
 
 #   ------查看导入的数据----------
 # target, label = next(iter(base_loader))
@@ -100,6 +105,15 @@ test_loader = test_datamgr.get_data_loader(test_file, aug=False)
 # print(target.size())
 # print(label.size())
 # print('--------------------')
+# target1, label1 = next(iter(train_loader))
+# print(len(train_loader))
+# print(target1.size())
+# print(label1.size())
+# print('--------------------')
+# target2, label2 = next(iter(val_loader))
+# print(len(val_loader))
+# print(target2.size())
+# print(label2.size())
 
 # ----------- 导入模型 -------------------------
 # model = mae_vit_base_patch16()
@@ -111,6 +125,8 @@ test_loader = test_datamgr.get_data_loader(test_file, aug=False)
 # # from torchinfo import summary
 # # summary(model,[5,3,224,224])
 
+# # del model.fc                         # 删除最后的全连接层
+# model.eval()
 
 def cache_model(support,query,model,mask_ratio=[0, 0.25, 0.5, 0.75],modal='mean'):
     
@@ -193,8 +209,87 @@ def mean_confidence_interval(data, confidence=0.95):
 	m, se = np.mean(a), scipy.stats.sem(a)
 	h = se * sp.stats.t._ppf((1+confidence)/2., n-1)
 	return m,h
+       
+def train(train_loader,params,model,optimizer,loss_fn,epoch_index):
+
+    batch_time = AverageMeter()
+    data_time = AverageMeter()
+    losses = AverageMeter()
+    top1 = AverageMeter()
+    end = time.time()
+    for episode_index, (temp2,target) in enumerate(train_loader):   
+    # temp2, _ =next(iter(train_loader))
+        
+        # Measure data loading time
+        data_time.update(time.time() - end)
+                
+        support,query = temp2.split([params.n_shot,params.n_query],dim=1)
+        cache_values, q_values = target.split([params.n_shot,params.n_query],dim=1)
+
+        # cache_values = F.one_hot(cache_values).half()
+        cache_values = cache_values.reshape(-1)
+        q_values = q_values.reshape(-1)
+        cache_values, q_values = cache_values.cuda(), q_values.cuda()
+
+        n,k,c,h,w = support.shape
+        support = support.reshape(-1,c,h,w)
+        support = support.cuda()
+        query = query.reshape(-1,c,h,w)
+        query = query.cuda()
+
+        # ---------图像组合--------------
+        
+        #--------方法1：将各自取50%，然后直接拼接-----------
+        query_patch = patchify(query)          # torch.Size([75, 196, 768])
+        support_patch = patchify(support)  
+        query_patch, _, _ = random_masking(query_patch)         # torch.Size([75, 98, 768])
+        support_patch, _, _ = random_masking(support_patch)
+        # print(query_patch.shape)
+        # print(support_patch.shape)
+        imags = torch.cat((query_patch.unsqueeze(1).repeat(1,params.train_n_way*params.n_shot,1,1), support_patch.unsqueeze(0).repeat(params.train_n_way*params.n_query,1,1,1)), dim=2)
+        # print(imags.shape)
+        imags = imags.reshape(-1,imags.shape[2],imags.shape[3])
+        imags = unpatchify(imags)
+        # print(imags.shape)
+        label = torch.eq(q_values.unsqueeze(1).repeat(1,params.train_n_way*params.n_shot),cache_values.unsqueeze(0).repeat(params.train_n_way*params.n_query,1)).type(torch.float32)
+        label = label.reshape(-1)
+
+        outputs = model(imags)
+        outputs = F.sigmoid(outputs).reshape(-1)
+        loss = loss_fn(outputs,label)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        # pred = outputs.reshape(-1,params.train_n_way*params.n_shot).data.max(1)[1]
+        pred = outputs.reshape(-1,params.train_n_way,params.n_shot).sum(-1).data.max(1)[1]
+        y = np.repeat(range(params.val_n_way),params.n_query)
+        y = torch.from_numpy(y)
+        y = y.cuda()
+        pred = pred.eq(y).sum()/query_patch.shape[0]
+
+        losses.update(loss.item(), query_patch.shape[0])
+        top1.update(pred, query_patch.shape[0])
+
+        # Measure elapsed time
+        batch_time.update(time.time() - end)
+        end = time.time()
+        
+        #============== print the intermediate results ==============#
+        if episode_index % params.print_freq == 0 and episode_index != 0:
+
+            log('Eposide-({0}): [{1}/{2}]\t'
+				'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+				'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
+				'Loss {loss.val:.3f} ({loss.avg:.3f})\t'
+				'Prec@1 {top1.val:.3f} ({top1.avg:.3f})'.format(
+					epoch_index, episode_index, len(train_loader), batch_time=batch_time, data_time=data_time, loss=losses, top1=top1))
+
+
+    return loss, pred
     
-def test(test_loader,params,model,epoch_index,best_prec1,loss_fn):
+def validate(val_loader,params,model,epoch_index,best_prec1,loss_fn):
     batch_time = AverageMeter()
     losses = AverageMeter()
     top1 = AverageMeter()
@@ -206,7 +301,7 @@ def test(test_loader,params,model,epoch_index,best_prec1,loss_fn):
 
 
     end = time.time()
-    for episode_index, (temp2,target) in enumerate(test_loader):   
+    for episode_index, (temp2,target) in enumerate(val_loader):   
     # temp2, _ =next(iter(train_loader))
 
         support,query = temp2.split([params.n_shot,params.n_query],dim=1)
@@ -232,34 +327,34 @@ def test(test_loader,params,model,epoch_index,best_prec1,loss_fn):
         support_patch, _, _ = random_masking(support_patch)
         # print(query_patch.shape)
         # print(support_patch.shape)
-        imags = torch.cat((query_patch.unsqueeze(1).repeat(1,params.val_n_way*params.n_shot,1,1), support_patch.unsqueeze(0).repeat(params.val_n_way*params.n_query,1,1,1)), dim=2)
+        imags = torch.cat((query_patch.unsqueeze(1).repeat(1,params.train_n_way*params.n_shot,1,1), support_patch.unsqueeze(0).repeat(params.train_n_way*params.n_query,1,1,1)), dim=2)
         # print(imags.shape)
         imags = imags.reshape(-1,imags.shape[2],imags.shape[3])
         imags = unpatchify(imags)
         # print(imags.shape)
-        label = torch.eq(q_values.unsqueeze(1).repeat(1,params.val_n_way*params.n_shot),cache_values.unsqueeze(0).repeat(params.val_n_way*params.n_query,1)).type(torch.float32)
+        label = torch.eq(q_values.unsqueeze(1).repeat(1,params.train_n_way*params.n_shot),cache_values.unsqueeze(0).repeat(params.train_n_way*params.n_query,1)).type(torch.float32)
         label = label.reshape(-1)
-        with torch.no_grad():
-            outputs = model(imags)
+
+        outputs = model(imags)
         outputs = F.sigmoid(outputs).reshape(-1)
         loss = loss_fn(outputs,label)
 
-        # pred = outputs.reshape(-1,params.val_n_way*params.n_shot).data.max(1)[1]
-        pred = outputs.reshape(-1,params.val_n_way,params.n_shot).sum(-1).data.max(1)[1]
+        pred = outputs.reshape(-1,params.train_n_way,params.n_shot).sum(-1).data.max(1)[1]
         y = np.repeat(range(params.val_n_way),params.n_query)
         y = torch.from_numpy(y)
         y = y.cuda()
-        pred = pred.eq(y).sum()/params.val_n_way/params.n_query
+        pred = pred.eq(y).sum()/query_patch.shape[0]
         
         losses.update(loss.item(), query_patch.size(0))
         top1.update(pred, query_patch.size(0))
         accuracies.append(pred)
-        
-        best_prec1 = max(best_prec1, top1.val)
+
 
 		# measure elapsed time
         batch_time.update(time.time() - end)
         end = time.time()
+
+        best_prec1 = max(best_prec1,top1.val)
         #============== print the intermediate results ==============#
         if episode_index % params.print_freq == 0 and episode_index != 0:
 
@@ -267,9 +362,9 @@ def test(test_loader,params,model,epoch_index,best_prec1,loss_fn):
 				'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
 				'Loss {loss.val:.3f} ({loss.avg:.3f})\t'
 				'Prec@1 {top1.val:.3f} ({top1.avg:.3f})'.format(
-					epoch_index, episode_index, len(test_loader), batch_time=batch_time, loss=losses, top1=top1))
+					epoch_index, episode_index, len(val_loader), batch_time=batch_time, loss=losses, top1=top1))
 	
-        log(' * Prec@1 {top1.avg:.3f} Best_prec1 {best_prec1:.3f}'.format(top1=top1, best_prec1=best_prec1))
+        # log(' * Prec@1 {top1.avg:.3f} Best_prec1 {best_prec1:.3f}'.format(top1=top1, best_prec1=best_prec1))
 
     return top1.avg, accuracies
 
@@ -278,48 +373,115 @@ def test(test_loader,params,model,epoch_index,best_prec1,loss_fn):
 
 def main():
     model = models_vit.__dict__[params.model](
-        num_classes=1,
+        num_classes=256,
         global_pool=params.global_pool,
     )
-    
-    if not params.mlp:
-        checkpoint = torch.load('/home/jiangweihao/CodeLab/PytorchCode/MAE_fsl/save/mini_imagenet_300_1_mae_image_compose/model_best.pth.tar')
-        model.head = torch.nn.Sequential(torch.nn.BatchNorm1d(model.head.in_features, affine=False, eps=1e-6), model.head)
+
+
+    checkpoint = torch.load('/home/jiangweihao/CodeLab/PytorchCode/mae_fsl/checkpoint/mae_pretrain_vit_base.pth')
+
+
+    checkpoint_model = checkpoint['model']
+    state_dict = model.state_dict()
+    for k in ['head.weight', 'head.bias']:
+        if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
+            print(f"Removing key {k} from pretrained checkpoint")
+            del checkpoint_model[k]
+
+    # interpolate position embedding
+    # interpolate_pos_embed(model, checkpoint_model)
+
+    # load pre-trained model
+    msg = model.load_state_dict(checkpoint_model, strict=False)
+    print(msg)
+
+    if params.global_pool:
+        assert set(msg.missing_keys) == {'head.weight', 'head.bias', 'fc_norm.weight', 'fc_norm.bias'}
     else:
-        checkpoint = torch.load('/home/jiangweihao/CodeLab/PytorchCode/MAE_fsl/save/mini_imagenet_train_task-600_shot-5_mae_image_compose_mlp/model_best.pth.tar')
-        model.head = torch.nn.Sequential(torch.nn.BatchNorm1d(model.head.in_features, affine=False, eps=1e-6), 
+        assert set(msg.missing_keys) == {'head.weight', 'head.bias'}
+
+    # manually initialize fc layer: following MoCo v3
+    trunc_normal_(model.head.weight, std=0.01) 
+ 
+    # for linear prob only
+    # hack: revise model's head with BN
+    model.head = torch.nn.Sequential(torch.nn.BatchNorm1d(model.head.in_features, affine=False, eps=1e-6), 
                                      model.head,
                                      torch.nn.ReLU(),
                                      torch.nn.Linear(256,1)
                                      )               # 768 -> 256 -> 1
-    model.load_state_dict(checkpoint['state_dict'], strict=True)
+    # freeze all but the head
+    for _, p in model.named_parameters():
+        p.requires_grad = False
+    for _, p in model.head.named_parameters():
+        p.requires_grad = True
+
     model.to('cuda')
     # ---------------------------------------------
     loss_fn = torch.nn.MSELoss()
 
-    epochs = 1
-    log('==========start testing ===============')
+    optimizer = torch.optim.SGD([p for p in model.parameters() if p.requires_grad], lr = 0.01, momentum=params.momentum, weight_decay=params.weight_decay)                
+
+    schedule = torch.optim.lr_scheduler.MultiStepLR(optimizer,milestones=[2,5],gamma=0.1)     #[30,60]
+    epochs = 10
+    log('==========start training ===============')
     
-    # loss_all = []
-    # pred_all = []
+    loss_all = []
+    pred_all = []
     best_prec1 = 0
     for epoch in range(epochs): 
+        log('==========training on train set===============')
+        epoch_learning_rate = 0.1
+        for param_group in optimizer.param_groups:
+            epoch_learning_rate = param_group['lr']
+            
+        log( 'Train Epoch: {}\tLearning Rate: {:.4f}'.format(
+                            epoch, epoch_learning_rate))
+        loss,pred = train(train_loader,params,model,optimizer,loss_fn,epoch)
+
+        loss_all.append(loss.item())
+        pred_all.append(pred.item())
+
+        schedule.step()
+
+        if epoch % 10 == 0:
+            log('============ Validation on the val set ============')
+            prec1, _ = validate(train_loader,params,model,epoch,best_prec1,loss_fn)
         
-        prec1, accuracies = test(test_loader,params,model,epoch,best_prec1,loss_fn)
+        	# record the best prec@1 and save checkpoint
+        is_best = prec1 > best_prec1
+        best_prec1 = max(prec1, best_prec1)
 
-        acc, h = mean_confidence_interval(accuracies)
-        log('prec1:{:.3f}'.format(prec1))
-        log('vag acc:{:.3f}'.format(acc))
-        log('confidence_interval:{:.3f}:'.format(h))
+        # save the checkpoint
+        if is_best:
+            save_checkpoint(
+                {
+                    'epoch_index': epoch,
+                    'arch': 'opt.basemodel',
+                    'state_dict': model.state_dict(),
+                    'best_prec1': best_prec1,
+                    'optimizer' : optimizer.state_dict(),
+                }, os.path.join(log_path, 'model_best.pth.tar'))
 
-    
+
+        if epoch % 10 == 0:
+            filename = os.path.join(log_path, 'epoch_%d.pth.tar' %epoch)
+            save_checkpoint(
+            {
+                'epoch_index': epoch,
+                'arch': "opt.basemodel",
+                'state_dict': model.state_dict(),
+                'best_prec1': best_prec1,
+                'optimizer' : optimizer.state_dict(),
+            }, filename)
 
 
 if __name__ == '__main__':
 
     start = time.time()
     main()
-    log('total test time(s):')
     log(time.time()-start)
-    log('===========================testing end!===================================')
+    log('===========================training end!===================================')
+
+
 

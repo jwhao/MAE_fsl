@@ -32,18 +32,18 @@ import argparse
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--image_size', default=224, type=int, choices=[84, 224], help='input image size, 84 for miniImagenet and tieredImagenet, 224 for cub')
-parser.add_argument('--dataset', default='mini_imagenet', choices=['mini_imagenet','tiered_imagenet','cub','fc100'])
+parser.add_argument('--dataset', default='mini_imagenet', choices=['mini_imagenet','tiered_imagenet','cub'])
 parser.add_argument('--data_path', default='/home/jiangweihao/CodeLab/data/mini-imagenet/',type=str, help='dataset path')
 
 parser.add_argument('--train_n_episode', default=600, type=int, help='number of episodes in meta train')
 parser.add_argument('--test_n_episode', default=1000, type=int, help='number of episodes in meta val')
 parser.add_argument('--train_n_way', default=5, type=int, help='number of classes used for meta train')
 parser.add_argument('--val_n_way', default=5, type=int, help='number of classes used for meta val')
-parser.add_argument('--n_shot', default=5, type=int, help='number of labeled data in each class, same as n_support')
+parser.add_argument('--n_shot', default=1, type=int, help='number of labeled data in each class, same as n_support')
 parser.add_argument('--n_query', default=1, type=int, help='number of unlabeled data in each class')
 parser.add_argument('--num_classes', default=64, type=int, help='total number of classes in pretrain')
 parser.add_argument('--model', default='vit_base_patch16', type=str, metavar='MODEL',
-                        help='Name of model to train')
+                        help='Name of model to train')        # vit_large_patch16
 parser.add_argument('--global_pool', action='store_true')
 parser.add_argument('--batch_size', default=128, type=int, help='total number of batch_size in pretrain')
 parser.add_argument('--print_freq', default=10, type=int, help='total number of inner frequency')
@@ -51,7 +51,7 @@ parser.add_argument('--print_freq', default=10, type=int, help='total number of 
 parser.add_argument('--momentum', default=0.9, type=int, help='parameter of optimization')
 parser.add_argument('--weight_decay', default=5.e-4, type=int, help='parameter of optimization')
 
-parser.add_argument('--gpu', default='0')
+parser.add_argument('--gpu', default='1')
 parser.add_argument('--epochs', default=100)
 
 parser.add_argument('--mlp', action='store_true')
@@ -61,7 +61,7 @@ params = parser.parse_args()
 
 # 设置日志记录路径
 log_path = os.path.dirname(os.path.abspath(__file__))
-log_path = os.path.join(log_path,'save/{}_test_task-{}_shot-{}_mae[{}]_image_complement_mlp[{}]_ft[{}]'.format(
+log_path = os.path.join(log_path,'save/{}_test_task-{}_shot-{}_mae[{}]_image_complement_mlp[{}]_ft[{}]_mm'.format(
                                 params.dataset,params.test_n_episode,params.n_shot,params.model,params.mlp,params.ft))
 ensure_path(log_path)
 set_log_path(log_path)
@@ -71,35 +71,27 @@ log(params)
 # -------------设置GPU--------------------
 set_gpu(params.gpu)
 # -------------导入数据--------------------
-test_file = 'test'
+
 json_file_read = False
 if params.dataset == 'mini_imagenet':
-    base_file = 'train'
-    val_file = 'val'
-    test_file = 'test'
-    params.num_classes = 64
+        base_file = 'train'
+        val_file = 'val'
+        params.num_classes = 64
 elif params.dataset == 'cub':
     base_file = 'base.json'
     val_file = 'val.json'
-    test_file = 'novel.json'
     json_file_read = True
     params.num_classes = 200
 elif params.dataset == 'tiered_imagenet':
     base_file = 'train'
     val_file = 'val'
-    test_file = 'test'
     params.num_classes = 351
-elif params.dataset == 'fc100':
-    base_file = 'train'
-    val_file = 'val'
-    test_file = 'test'
-    params.num_classes = 60
 else:
     ValueError('dataset error')
 
 #------------ test data ------------------------
-# test_file = 'test'
-# json_file_read = False
+test_file = 'test'
+json_file_read = False
 test_few_shot_params = dict(n_way=params.val_n_way, n_support=params.n_shot)
 test_datamgr = SetDataManager(params.data_path, params.image_size, n_query=params.n_query, n_episode=params.test_n_episode, json_read=json_file_read, **test_few_shot_params)
 test_loader = test_datamgr.get_data_loader(test_file, aug=False)
@@ -222,6 +214,13 @@ def test(test_loader,params,model,epoch_index,best_prec1,loss_fn):
         support,query = temp2.split([params.n_shot,params.n_query],dim=1)
         cache_values, q_values = target.split([params.n_shot,params.n_query],dim=1)
 
+
+        #-----------------------copy support--------------
+        # 经验证，这种方法没啥效果；
+        n_copy = 1
+        # support = support.repeat(1,n_copy,1,1,1)                # 复制5份     
+        # cache_values = cache_values.repeat(1,n_copy)
+
         # cache_values = F.one_hot(cache_values).half()
         cache_values = cache_values.reshape(-1)
         q_values = q_values.reshape(-1)
@@ -236,14 +235,26 @@ def test(test_loader,params,model,epoch_index,best_prec1,loss_fn):
         # ---------图像组合--------------
         
         #--------方法2：将support取50%，query填充其掩码部分，互补拼接-----------
+        # mask_ratio = np.random.uniform(0.25,0.75)
+        mask_ratio_list = [0.5]         # [0.25,0.5,0.75]   [0.5,0.5,0.5,0.5,0.5]  
+        n_copy = len(mask_ratio_list)
         query_patch = patchify(query)          # torch.Size([75, 196, 768])
-        support_patch = patchify(support)  
-        imags = random_compose(query_patch,support_patch)
+        support_patch = patchify(support)
+        imags = torch.tensor([]).cuda()  
+        for i in range(n_copy):
+            imag = random_compose(query_patch,support_patch,mask_ratio=mask_ratio_list[i])
+            # imags0 = random_compose(query_patch,support_patch,mask_ratio=mask_ratio_list[0])
+            # imags1 = random_compose(query_patch,support_patch,mask_ratio=mask_ratio_list[1])
+            # imags2 = random_compose(query_patch,support_patch,mask_ratio=mask_ratio_list[2])
+
+            # images = torch.cat((imags0,imags1,imags2),1)
+            imags = torch.cat((imags,imag),1)
 
         imags = imags.reshape(-1,imags.shape[2],imags.shape[3])
         imags = unpatchify(imags)
         # print(imags.shape)
-        label = torch.eq(q_values.unsqueeze(1).repeat(1,params.val_n_way*params.n_shot),cache_values.unsqueeze(0).repeat(params.val_n_way*params.n_query,1)).type(torch.float32)
+        # label = torch.eq(q_values.unsqueeze(1).repeat(1,params.val_n_way*params.n_shot*n_copy),cache_values.unsqueeze(0).repeat(params.val_n_way*params.n_query,1)).type(torch.float32)
+        label = torch.eq(q_values.unsqueeze(1).repeat(1,params.val_n_way*params.n_shot*n_copy),cache_values.unsqueeze(0).repeat(params.val_n_way*params.n_query,n_copy)).type(torch.float32)
         label = label.reshape(-1)
         with torch.no_grad():
             outputs = model(imags)
@@ -251,7 +262,9 @@ def test(test_loader,params,model,epoch_index,best_prec1,loss_fn):
         loss = loss_fn(outputs,label)
 
         # pred = outputs.reshape(-1,params.val_n_way*params.n_shot).data.max(1)[1]
-        pred = outputs.reshape(-1,params.val_n_way,params.n_shot).sum(-1).data.max(1)[1]
+        # pred = outputs.reshape(-1,params.val_n_way,params.n_shot*n_copy).sum(-1).data.max(1)[1]
+        pred = outputs.reshape(-1,params.val_n_way*params.n_shot*n_copy)
+        pred = torch.stack([pred[:,i::5] for i in range(5)],0).sum(-1).data.max(1)[1]
         y = np.repeat(range(params.val_n_way),params.n_query)
         y = torch.from_numpy(y)
         y = y.cuda()
@@ -294,7 +307,8 @@ def main():
     # model.head = torch.nn.Sequential(torch.nn.BatchNorm1d(model.head.in_features, affine=False, eps=1e-6), model.head)
 
     if not params.mlp:
-        checkpoint = torch.load('/home/jiangweihao/CodeLab/PytorchCode/MAE_fsl/save/mini_imagenet_train_task-600_shot-5_mae_image_compolement/model_best.pth.tar')
+        # checkpoint = torch.load('/home/jiangweihao/CodeLab/PytorchCode/MAE_fsl/save/mini_imagenet_train_task-600_shot-5_mae_image_compolement/model_best.pth.tar')
+        checkpoint = torch.load('/home/jiangweihao/CodeLab/PytorchCode/MAE_fsl/save/mini_imagenet_train_task-600_shot-5_mae[vit_base_patch16]_image_compolement_FT[False]_mm/model_best.pth.tar')
         model.head = torch.nn.Sequential(torch.nn.BatchNorm1d(model.head.in_features, affine=False, eps=1e-6), model.head)
         if params.ft:
             checkpoint = torch.load('/home/jiangweihao/CodeLab/PytorchCode/MAE_fsl/save/mini_imagenet_train_task-600_shot-5_mae_image_compolement_FT[True]/model_best.pth.tar')  

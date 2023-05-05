@@ -17,9 +17,9 @@ torch.manual_seed(1)
 import tqdm
 from torch.nn.parallel import DataParallel
 # torch.backends.cudnn.benchmark = True
-from models.models_mae import mae_vit_base_patch16
+from models.models_mae import mae_vit_base_patch16,mae_vit_large_patch16
 # from sklearn import svm     #导入算法模块
-import timm 
+import timm
 
 # assert timm.__version__ == "0.3.2" # version check
 from timm.models.layers import trunc_normal_
@@ -35,7 +35,7 @@ parser.add_argument('--image_size', default=224, type=int, choices=[84, 224], he
 parser.add_argument('--dataset', default='mini_imagenet', choices=['mini_imagenet','tiered_imagenet','cub'])
 parser.add_argument('--data_path', default='/home/jiangweihao/CodeLab/data/mini-imagenet/',type=str, help='dataset path')
 
-parser.add_argument('--train_n_episode', default=600, type=int, help='number of episodes in meta train')
+parser.add_argument('--train_n_episode', default=1000, type=int, help='number of episodes in meta train')
 parser.add_argument('--val_n_episode', default=300, type=int, help='number of episodes in meta val')
 parser.add_argument('--train_n_way', default=5, type=int, help='number of classes used for meta train')
 parser.add_argument('--val_n_way', default=5, type=int, help='number of classes used for meta val')
@@ -48,17 +48,19 @@ parser.add_argument('--global_pool', action='store_true')
 parser.add_argument('--batch_size', default=128, type=int, help='total number of batch_size in pretrain')
 parser.add_argument('--print_freq', default=10, type=int, help='total number of inner frequency')
 
-parser.add_argument('--momentum', default=0.9, type=int, help='parameter of optimization')
-parser.add_argument('--weight_decay', default=5.e-4, type=int, help='parameter of optimization')
+parser.add_argument('--momentum', default=0.9, type=float, help='parameter of optimization')
+parser.add_argument('--weight_decay', default=5.e-4, type=float, help='parameter of optimization')
 
-parser.add_argument('--gpu', default='1')
-parser.add_argument('--epochs', default=10)
+parser.add_argument('--gpu', default='0')
+parser.add_argument('--epochs', default=10,type=int)
+
+parser.add_argument('--ft', action='store_true')
 
 params = parser.parse_args()
 
 # 设置日志记录路径
 log_path = os.path.dirname(os.path.abspath(__file__))
-log_path = os.path.join(log_path,'save/{}_train_task-{}_shot-{}_mae_image_compolement_mlp'.format(params.dataset,params.train_n_episode,params.n_shot))
+log_path = os.path.join(log_path,'save/{}_train_task-{}_shot-{}_mae[{}]_image_compolement_FT[{}]_mm_coslr'.format(params.dataset,params.train_n_episode,params.n_shot,params.model,params.ft))
 ensure_path(log_path)
 set_log_path(log_path)
 log('log and pth save path:  %s'%(log_path))
@@ -240,9 +242,10 @@ def train(train_loader,params,model,optimizer,loss_fn,epoch_index):
         # ---------图像组合--------------
         
         #--------方法2：将support取50%，query填充其掩码部分，互补拼接-----------
+        mask_ratio = np.random.uniform(0.25,0.75)                              # 设置不同mask
         query_patch = patchify(query)          # torch.Size([75, 196, 768])
         support_patch = patchify(support)  
-        imags = random_compose(query_patch,support_patch)
+        imags = random_compose(query_patch,support_patch,mask_ratio=mask_ratio)
         # query_patch, _, _ = random_masking(query_patch)         # torch.Size([75, 98, 768])
         # support_patch, _, _ = random_masking(support_patch)
         # # print(query_patch.shape)
@@ -322,9 +325,10 @@ def validate(val_loader,params,model,epoch_index,best_prec1,loss_fn):
         # ---------图像组合--------------
         
         #--------方法2：将support取50%，query填充其掩码部分，互补拼接-----------
+        mask_ratio = np.random.uniform(0.25,0.75)  
         query_patch = patchify(query)          # torch.Size([75, 196, 768])
         support_patch = patchify(support)  
-        imags = random_compose(query_patch,support_patch)
+        imags = random_compose(query_patch,support_patch,mask_ratio=mask_ratio)
         # query_patch, _, _ = random_masking(query_patch)         # torch.Size([75, 98, 768])
         # support_patch, _, _ = random_masking(support_patch)
         # # print(query_patch.shape)
@@ -336,8 +340,8 @@ def validate(val_loader,params,model,epoch_index,best_prec1,loss_fn):
         # print(imags.shape)
         label = torch.eq(q_values.unsqueeze(1).repeat(1,params.train_n_way*params.n_shot),cache_values.unsqueeze(0).repeat(params.train_n_way*params.n_query,1)).type(torch.float32)
         label = label.reshape(-1)
-
-        outputs = model(imags)
+        with torch.no_grad():
+            outputs = model(imags)
         outputs = F.sigmoid(outputs).reshape(-1)
         loss = loss_fn(outputs,label)
 
@@ -375,12 +379,15 @@ def validate(val_loader,params,model,epoch_index,best_prec1,loss_fn):
 
 def main():
     model = models_vit.__dict__[params.model](
-        num_classes=256,
+        num_classes=1,
         global_pool=params.global_pool,
     )
 
+    if params.model == 'vit_base_patch16':
+        checkpoint = torch.load('/home/jiangweihao/CodeLab/PytorchCode/mae_fsl/checkpoint/mae_pretrain_vit_base.pth')
+    else:
+        checkpoint = torch.load('/home/jiangweihao/CodeLab/PytorchCode/mae_fsl/checkpoint/mae_pretrain_vit_large.pth')
 
-    checkpoint = torch.load('/home/jiangweihao/CodeLab/PytorchCode/mae_fsl/checkpoint/mae_pretrain_vit_base.pth')
 
 
     checkpoint_model = checkpoint['model']
@@ -407,15 +414,15 @@ def main():
 
     # for linear prob only
     # hack: revise model's head with BN
-    # model.head = torch.nn.Sequential(torch.nn.BatchNorm1d(model.head.in_features, affine=False, eps=1e-6), model.head)
-    model.head = torch.nn.Sequential(torch.nn.BatchNorm1d(model.head.in_features, affine=False, eps=1e-6), 
-                                    model.head,
-                                    torch.nn.ReLU(),
-                                    torch.nn.Linear(256,1)
-                                    )               # 768 -> 256 -> 1
+    model.head = torch.nn.Sequential(torch.nn.BatchNorm1d(model.head.in_features, affine=False, eps=1e-6), model.head)
     # freeze all but the head
+    # parameters = []
     for _, p in model.named_parameters():
         p.requires_grad = False
+        if params.ft and 'blocks.11.mlp' in _:
+            log(_)
+            p.requires_grad = True
+            # parameters.append(_)
     for _, p in model.head.named_parameters():
         p.requires_grad = True
 
@@ -423,10 +430,21 @@ def main():
     # ---------------------------------------------
     loss_fn = torch.nn.MSELoss()
 
-    optimizer = torch.optim.SGD([p for p in model.parameters() if p.requires_grad], lr = 0.01, momentum=params.momentum, weight_decay=params.weight_decay)                
+    # optimizer = torch.optim.SGD([p for p in model.parameters() if p.requires_grad], lr = 0.01, momentum=params.momentum, weight_decay=params.weight_decay)
+    
+    if params.ft:
+        parameters = [p for _, p in model.blocks.named_parameters() if p.requires_grad]
+        parameter = [
+             {'params': parameters, 'lr': 1e-3},
+            {'params': model.head.parameters(), 'lr': 1e-1}]
+        optimizer = torch.optim.SGD(parameter, lr=0.001, momentum=params.momentum, weight_decay=params.weight_decay)
+    else:
+        optimizer = torch.optim.SGD([p for p in model.parameters() if p.requires_grad], lr = 0.01, momentum=params.momentum, weight_decay=params.weight_decay)
 
-    schedule = torch.optim.lr_scheduler.MultiStepLR(optimizer,milestones=[3, 6],gamma=0.1)     #[30,60]
-    # epochs = 10
+
+    # schedule = torch.optim.lr_scheduler.MultiStepLR(optimizer,milestones=[2, 4, 6,8],gamma=0.1)     #[30,60]
+    schedule = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer,T_max=2)     #[30,60]
+    # epochs = params.epochs
     log('==========start training ===============')
     
     loss_all = []
@@ -434,9 +452,9 @@ def main():
     best_prec1 = 0
     for epoch in range(params.epochs): 
         log('==========training on train set===============')
-        epoch_learning_rate = 0.1
+        # epoch_learning_rate = 0.01
         for param_group in optimizer.param_groups:
-            epoch_learning_rate = param_group['lr']
+            epoch_learning_rate = param_group['lr']          # scheduler.get_lr()
             
         log( 'Train Epoch: {}\tLearning Rate: {:.4f}'.format(
                             epoch, epoch_learning_rate))
@@ -447,7 +465,7 @@ def main():
 
         schedule.step()
 
-        if epoch % 2 == 0:
+        if epoch % 1 == 0:
             log('============ Validation on the val set ============')
             prec1, _ = validate(train_loader,params,model,epoch,best_prec1,loss_fn)
         

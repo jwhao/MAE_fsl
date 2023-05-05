@@ -43,7 +43,7 @@ parser.add_argument('--n_shot', default=5, type=int, help='number of labeled dat
 parser.add_argument('--n_query', default=5, type=int, help='number of unlabeled data in each class')
 parser.add_argument('--num_classes', default=64, type=int, help='total number of classes in pretrain')
 parser.add_argument('--model', default='vit_base_patch16', type=str, metavar='MODEL',
-                        help='Name of model to train')
+                        help='Name of model to train')           # 'vit_large_patch16'
 parser.add_argument('--global_pool', action='store_true')
 parser.add_argument('--batch_size', default=128, type=int, help='total number of batch_size in pretrain')
 parser.add_argument('--print_freq', default=10, type=int, help='total number of inner frequency')
@@ -51,16 +51,16 @@ parser.add_argument('--print_freq', default=10, type=int, help='total number of 
 parser.add_argument('--momentum', default=0.9, type=float, help='parameter of optimization')
 parser.add_argument('--weight_decay', default=5.e-4, type=float, help='parameter of optimization')
 
-parser.add_argument('--gpu', default='0')
-parser.add_argument('--epochs', default=100,type=int)
+parser.add_argument('--gpu', default='1')
+parser.add_argument('--epochs', default=10,type=int)
 
 parser.add_argument('--ft', action='store_true')
 
 params = parser.parse_args()
-
+params.ft = True                               # only for debug
 # 设置日志记录路径
 log_path = os.path.dirname(os.path.abspath(__file__))
-log_path = os.path.join(log_path,'save/{}_train_task-{}_shot-{}_mae_image_compolement_FT[{}]'.format(params.dataset,params.train_n_episode,params.n_shot,params.ft))
+log_path = os.path.join(log_path,'save/{}_train_task-{}_shot-{}_mae[{}]_image_compolement_FT[{}]'.format(params.dataset,params.train_n_episode,params.n_shot,params.model,params.ft))
 ensure_path(log_path)
 set_log_path(log_path)
 log('log and pth save path:  %s'%(log_path))
@@ -72,18 +72,20 @@ set_gpu(params.gpu)
 
 json_file_read = False
 if params.dataset == 'mini_imagenet':
-        base_file = 'train'
-        val_file = 'val'
-        params.num_classes = 64
+    base_file = 'train'
+    val_file = 'val'
+    params.num_classes = 64
 elif params.dataset == 'cub':
     base_file = 'base.json'
     val_file = 'val.json'
     json_file_read = True
     params.num_classes = 200
+    params.data_path = '/home/jiangweihao/CodeLab/data/CUB'
 elif params.dataset == 'tiered_imagenet':
     base_file = 'train'
     val_file = 'val'
     params.num_classes = 351
+    params.data_path = '/home/jiangweihao/CodeLab/data/tiered_imagenet'
 else:
     ValueError('dataset error')
 
@@ -414,11 +416,13 @@ def main():
     # hack: revise model's head with BN
     model.head = torch.nn.Sequential(torch.nn.BatchNorm1d(model.head.in_features, affine=False, eps=1e-6), model.head)
     # freeze all but the head
+    # parameters = []
     for _, p in model.named_parameters():
         p.requires_grad = False
         if params.ft and 'blocks.11.mlp' in _:
             log(_)
             p.requires_grad = True
+            # parameters.append(_)
     for _, p in model.head.named_parameters():
         p.requires_grad = True
 
@@ -426,23 +430,35 @@ def main():
     # ---------------------------------------------
     loss_fn = torch.nn.MSELoss()
 
-    optimizer = torch.optim.SGD([p for p in model.parameters() if p.requires_grad], lr = 0.01, momentum=params.momentum, weight_decay=params.weight_decay)                
+    # optimizer = torch.optim.SGD([p for p in model.parameters() if p.requires_grad], lr = 0.01, momentum=params.momentum, weight_decay=params.weight_decay)
+    
+    if params.ft:
+        parameters = [p for _, p in model.blocks.named_parameters() if p.requires_grad]
+        parameter = [
+             {'params': parameters, 'lr': 1e-3},
+            {'params': model.head.parameters(), 'lr': 1e-2}]
+        optimizer = torch.optim.SGD(parameter, lr=0.001, momentum=params.momentum, weight_decay=params.weight_decay)
+    else:
+        optimizer = torch.optim.SGD([p for p in model.parameters() if p.requires_grad], lr = 0.01, momentum=params.momentum, weight_decay=params.weight_decay)
 
-    schedule = torch.optim.lr_scheduler.MultiStepLR(optimizer,milestones=[3, 6],gamma=0.1)     #[30,60]
-    epochs = params.epochs
+
+    schedule = torch.optim.lr_scheduler.MultiStepLR(optimizer,milestones=[2,4,6],gamma=0.1)     #[30,60]
+    # epochs = params.epochs
     log('==========start training ===============')
     
     loss_all = []
     pred_all = []
     best_prec1 = 0
-    for epoch in range(epochs): 
+    for epoch in range(params.epochs): 
         log('==========training on train set===============')
         epoch_learning_rate = 0.1
         for param_group in optimizer.param_groups:
-            epoch_learning_rate = param_group['lr']
+            epoch_learning_rate = param_group['lr']          # scheduler.get_lr()
+            epoch_learning_rate1 = schedule.get_lr()
             
-        log( 'Train Epoch: {}\tLearning Rate: {:.4f}'.format(
-                            epoch, epoch_learning_rate))
+        log( 'Train Epoch: {}\tLearning Rate: {}'.format(
+                            epoch, epoch_learning_rate1))
+        # print('epoch_learning_rate1',epoch_learning_rate1)                           # -------------for debug
         loss,pred = train(train_loader,params,model,optimizer,loss_fn,epoch)
 
         loss_all.append(loss.item())
@@ -450,7 +466,7 @@ def main():
 
         schedule.step()
 
-        if epoch % 2 == 0:
+        if epoch % 1 == 0:
             log('============ Validation on the val set ============')
             prec1, _ = validate(train_loader,params,model,epoch,best_prec1,loss_fn)
         

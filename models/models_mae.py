@@ -17,7 +17,7 @@ import torch.nn as nn
 from timm.models.vision_transformer import PatchEmbed, Block
 
 import sys
-sys.path.append('/home/jiangweihao/code/MAE_fsl/models')
+sys.path.append('/home/jiangweihao/CodeLab/PytorchCode/MAE_fsl/models')
 
 from util.pos_embed import get_2d_sincos_pos_embed
 

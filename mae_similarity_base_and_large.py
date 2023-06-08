@@ -268,7 +268,7 @@ for idy, (temp2,target) in enumerate(tqdm(train_loader)):
 
     #--------cls + patch(mean) acc---+ large cls------
     # metric_cos = cov_cls + cov_patch + cov_cls_l
-    metric_cos = cov_cls_l
+    metric_cos = cov_patch + cov_cls_l
     pred = metric_cos.data.max(1)[1]
     cos_acc = pred.eq(y).sum()/(params.train_n_way*params.n_query)
     total_correct += pred.eq(y).sum()

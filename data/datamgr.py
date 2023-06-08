@@ -15,6 +15,8 @@ class TransformLoader:
         self.image_size = image_size
         if image_size == 84:
             self.resize_size = 92
+        if image_size == 112:
+            self.resize_size = 128          # jwh add
         elif image_size == 224:
             self.resize_size = 256
 

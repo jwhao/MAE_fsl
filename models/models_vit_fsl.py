@@ -39,18 +39,46 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         x = torch.cat((cls_tokens, x), dim=1)
         x = x + self.pos_embed
         x = self.pos_drop(x)
-
+        i = 0
         for blk in self.blocks:
-            x = blk(x)
+            x = blk(x)                                         # [30 =n_way*(n_shot+n_query),197,768]
+            i += 1
+            if i == 11:
+                n_shot = 5
+                n_query = 4
+                _,p,d = x.shape
+                x = x.reshape(5,-1,p,d)                        # [5,6,197,768]
+                xs = x[:,:n_shot].mean(1)                     # proto
+                xs_cls = xs[:,0].unsqueeze(1)                                 # support only keep patch_token
+                xs_patch = xs[:,1:]
+                # xs = xs.unsqueeze(0).repeat(5* n_query,1,1,1)
+                xq = x[:,n_shot:].reshape(-1,p,d)
+                xq_cls = xq[:,0].unsqueeze(1)                                    # query only keep cls_token
+                xq_patch = xq[:,1:]
 
+                xs_cls = xs_cls.unsqueeze(1).repeat(1,5*n_query,1,1)
+                xq_patch = xq_patch.unsqueeze(0).repeat(5,1,1,1)
+                xs_cls_xq_patch = torch.cat((xs_cls,xq_patch),dim=2).reshape(-1,p,d)
+
+                xq_cls = xq_cls.unsqueeze(1).repeat(1,5,1,1)
+                xs_patch = xs_patch.unsqueeze(0).repeat(5*n_query,1,1,1)
+                xq_cls_xs_patch = torch.cat((xq_cls,xs_patch),dim=2).reshape(-1,p,d)
+                
+                x = torch.cat((xs_cls_xq_patch,xq_cls_xs_patch),dim=0)
+        N = int(x.shape[0]/2)
         if self.global_pool:
-            x = x[:, 1:, :].mean(dim=1)  # global pool without cls token
-            outcome = self.fc_norm(x)
+            xq = x[:N, 1:, :].mean(dim=1)  # global pool without cls token
+            xs = x[N:, 1:, :].mean(dim=1)
+            outcome_q = self.fc_norm(xq)
+            outcome_s = self.fc_norm(xs)
         else:
             x = self.norm(x)
-            outcome = x[:, 0]
+            
+            outcome_q = x[N:, 0]
+            
+            outcome_s = x[:N, 0]
 
-        return outcome
+        return outcome_q, outcome_s
     
     def forward_head(self, x, pre_logits: bool = False):
         return x if pre_logits else self.head(x)

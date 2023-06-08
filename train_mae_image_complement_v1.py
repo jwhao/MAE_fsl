@@ -5,8 +5,8 @@ from models.predesigned_modules import resnet12
 import sys
 import os
 from utils import *
-# os.environ['CUDA_VISIBLE_DEVICES'] = "3"
-
+# os.environ['CUDA_VISIBLE_DEVICES'] = "2,3"
+from models.util.pos_embed import interpolate_pos_embed
 import time
 import numpy as np
 import warnings
@@ -20,7 +20,7 @@ from torch.nn.parallel import DataParallel
 from models.models_mae import mae_vit_base_patch16,mae_vit_large_patch16
 # from sklearn import svm     #导入算法模块
 import timm
-
+from torch.utils.tensorboard import SummaryWriter  
 # assert timm.__version__ == "0.3.2" # version check
 from timm.models.layers import trunc_normal_
 from models import models_vit
@@ -31,16 +31,17 @@ import scipy.stats
 import argparse
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--image_size', default=224, type=int, choices=[84, 224], help='input image size, 84 for miniImagenet and tieredImagenet, 224 for cub')
-parser.add_argument('--dataset', default='mini_imagenet', choices=['mini_imagenet','tiered_imagenet','cub'])
-parser.add_argument('--data_path', default='/home/jiangweihao/data/mini-imagenet',type=str, help='dataset path')
+parser.add_argument('--image_size', default=224, type=int, choices=[84, 112, 224], help='input image size, 84 for miniImagenet and tieredImagenet, 224 for cub')
+parser.add_argument('--dataset', default='mini_imagenet', choices=['mini_imagenet','tiered_imagenet','cub','fc100','fs','dtd','eurosat','pets','caltech101',
+                                                                   'aircraft','food101','oxford_flowers','cars','ucf101','sun397'])
+parser.add_argument('--data_path', default='/home/jiangweihao/data/mini-imagenet/',type=str, help='dataset path')
 
 parser.add_argument('--train_n_episode', default=600, type=int, help='number of episodes in meta train')
 parser.add_argument('--val_n_episode', default=300, type=int, help='number of episodes in meta val')
 parser.add_argument('--train_n_way', default=5, type=int, help='number of classes used for meta train')
 parser.add_argument('--val_n_way', default=5, type=int, help='number of classes used for meta val')
 parser.add_argument('--n_shot', default=5, type=int, help='number of labeled data in each class, same as n_support')
-parser.add_argument('--n_query', default=1, type=int, help='number of unlabeled data in each class')
+parser.add_argument('--n_query', default=4, type=int, help='number of unlabeled data in each class')
 parser.add_argument('--num_classes', default=64, type=int, help='total number of classes in pretrain')
 parser.add_argument('--model', default='vit_base_patch16', type=str, metavar='MODEL',
                         help='Name of model to train')           # 'vit_large_patch16'
@@ -51,17 +52,18 @@ parser.add_argument('--print_freq', default=10, type=int, help='total number of 
 parser.add_argument('--momentum', default=0.9, type=float, help='parameter of optimization')
 parser.add_argument('--weight_decay', default=5.e-4, type=float, help='parameter of optimization')
 
-parser.add_argument('--gpu', default='2,1,6')
-parser.add_argument('--epochs', default=30,type=int)
+parser.add_argument('--gpu', default='2,3,4,0')
+parser.add_argument('--epochs', default=100,type=int)
 
 parser.add_argument('--ft', action='store_true')
 
 params = parser.parse_args()
-params.ft = True                               # only for debug
+params.ft = True                               # -----------------only for debug-----------------------
+params.global_pool = True
 # 设置日志记录路径
 log_path = os.path.dirname(os.path.abspath(__file__))
-log_path = os.path.join(log_path,'save/{}_train_task-{}_shot-{}_mae[{}]_image_compolement_FT[{}]onelayer_global[{}]'.format(
-                            params.dataset,params.train_n_episode,params.n_shot,params.model,params.ft,params.global_pool))
+log_path = os.path.join(log_path,'save/{}_train_task-{}_shot-{}_mae[{}]_image_compolement_FT[{}]_global[{}]_mlp_v1_adam'.format(
+                                params.dataset,params.train_n_episode,params.n_shot,params.model,params.ft,params.global_pool))
 ensure_path(log_path)
 set_log_path(log_path)
 log('log and pth save path:  %s'%(log_path))
@@ -81,12 +83,62 @@ elif params.dataset == 'cub':
     val_file = 'val.json'
     json_file_read = True
     params.num_classes = 200
-    params.data_path = '/home/jiangweihao/data/CUB_200_2011'
+    params.data_path = '/home/jiangweihao/CodeLab/data/CUB'
 elif params.dataset == 'tiered_imagenet':
     base_file = 'train'
     val_file = 'val'
     params.num_classes = 351
     params.data_path = '/home/jiangweihao/data/tiered_imagenet'
+elif params.dataset == 'fc100':
+    base_file = 'train'
+    val_file = 'val'
+    params.num_classes = 60
+    params.data_path = '/home/jiangweihao/data/FC100'
+elif params.dataset == 'fs':
+    base_file = 'train'
+    val_file = 'val'
+    params.num_classes = 64
+    params.data_path = '/home/jiangweihao/data/cifar100'
+elif params.dataset == 'dtd':
+    base_file = 'images'
+    val_file = 'images'
+    params.data_path = '/data/jiangweihao/data/dtd'
+elif params.dataset == 'eurosat':
+    base_file = '2750'
+    val_file = '2750'
+    params.data_path = '/data/jiangweihao/data/eurosat'
+elif params.dataset == 'pets':
+    base_file = 'trainval'
+    val_file = 'trainval'
+    params.data_path = '/data/jiangweihao/data/oxford_pets'
+elif params.dataset == 'caltech101':
+    base_file = '101_ObjectCategories'
+    val_file = '101_ObjectCategories'
+    params.data_path = '/data/jiangweihao/data/caltech-101'
+elif params.dataset == 'aircraft':
+    base_file = 'train'
+    val_file = 'val'
+    params.data_path = '/data/jiangweihao/data/fgvc_aircraft'
+elif params.dataset == 'food101':
+    base_file = 'images'
+    val_file = 'images'
+    params.data_path = '/data/jiangweihao/data/food-101'
+elif params.dataset == 'oxford_flowers':
+    base_file = ' train'
+    val_file = 'val'
+    params.data_path = '/home/data/jiangweihao/data/oxford_flowers'
+elif params.dataset == 'cars':
+    base_file = 'train'
+    val_file = 'test'
+    params.data_path = '/home/data/jiangweihao/data/stanford_cars'
+elif params.dataset == 'ucf101':
+    base_file = 'UCF-101-midframes'
+    val_file = 'UCF-101-midframes'
+    params.data_path = '/home/data/jiangweihao/data/ucf101'
+elif params.dataset == 'sun397':
+    base_file = 'train'
+    val_file = 'val'
+    params.data_path = '/home/data/jiangweihao/data/sun397'
 else:
     ValueError('dataset error')
 
@@ -103,7 +155,7 @@ train_loader = train_datamgr.get_data_loader(base_file, aug=True)
 test_few_shot_params = dict(n_way=params.val_n_way, n_support=params.n_shot)
 val_datamgr = SetDataManager(params.data_path, params.image_size, n_query=params.n_query, n_episode=params.val_n_episode, json_read=json_file_read, **test_few_shot_params)
 val_loader = val_datamgr.get_data_loader(val_file, aug=False)
-
+'''
 #   ------查看导入的数据----------
 # target, label = next(iter(base_loader))
 # print(len(base_loader))
@@ -132,7 +184,7 @@ val_loader = val_datamgr.get_data_loader(val_file, aug=False)
 
 # # del model.fc                         # 删除最后的全连接层
 # model.eval()
-
+'''
 def cache_model(support,query,model,mask_ratio=[0, 0.25, 0.5, 0.75],modal='mean'):
     
     with torch.no_grad():
@@ -215,7 +267,7 @@ def mean_confidence_interval(data, confidence=0.95):
 	h = se * sp.stats.t._ppf((1+confidence)/2., n-1)
 	return m,h
        
-def train(train_loader,params,model,optimizer,loss_fn,epoch_index):
+def train(train_loader,params,model,optimizer,optimizer1,loss_fn,epoch_index):
 
     batch_time = AverageMeter()
     data_time = AverageMeter()
@@ -247,7 +299,7 @@ def train(train_loader,params,model,optimizer,loss_fn,epoch_index):
         #--------方法2：将support取50%，query填充其掩码部分，互补拼接-----------
         query_patch = patchify(query)          # torch.Size([75, 196, 768])
         support_patch = patchify(support)  
-        imags = random_compose(query_patch,support_patch)
+        imags, imags2 = random_compose_v2(query_patch,support_patch)
         # query_patch, _, _ = random_masking(query_patch)         # torch.Size([75, 98, 768])
         # support_patch, _, _ = random_masking(support_patch)
         # # print(query_patch.shape)
@@ -256,17 +308,22 @@ def train(train_loader,params,model,optimizer,loss_fn,epoch_index):
         # # print(imags.shape)
         imags = imags.reshape(-1,imags.shape[2],imags.shape[3])
         imags = unpatchify(imags)
+
+        imags2 = imags2.reshape(-1,imags2.shape[2],imags2.shape[3])
+        imags2 = unpatchify(imags2)
         # print(imags.shape)
         label = torch.eq(q_values.unsqueeze(1).repeat(1,params.train_n_way*params.n_shot),cache_values.unsqueeze(0).repeat(params.train_n_way*params.n_query,1)).type(torch.float32)
         label = label.reshape(-1)
 
-        outputs = model(imags)
+        outputs = model(imags) + model(imags2)
         outputs = F.sigmoid(outputs).reshape(-1)
         loss = loss_fn(outputs,label)
 
         optimizer.zero_grad()
+        optimizer1.zero_grad()
         loss.backward()
         optimizer.step()
+        optimizer1.step()
 
         # pred = outputs.reshape(-1,params.train_n_way*params.n_shot).data.max(1)[1]
         pred = outputs.reshape(-1,params.train_n_way,params.n_shot).sum(-1).data.max(1)[1]
@@ -293,7 +350,7 @@ def train(train_loader,params,model,optimizer,loss_fn,epoch_index):
 					epoch_index, episode_index, len(train_loader), batch_time=batch_time, data_time=data_time, loss=losses, top1=top1))
 
 
-    return loss, pred
+    return losses.avg, top1.avg
     
 def validate(val_loader,params,model,epoch_index,best_prec1,loss_fn):
     batch_time = AverageMeter()
@@ -329,7 +386,7 @@ def validate(val_loader,params,model,epoch_index,best_prec1,loss_fn):
         #--------方法2：将support取50%，query填充其掩码部分，互补拼接-----------
         query_patch = patchify(query)          # torch.Size([75, 196, 768])
         support_patch = patchify(support)  
-        imags = random_compose(query_patch,support_patch)
+        imags, imags2 = random_compose_v2(query_patch,support_patch)
         # query_patch, _, _ = random_masking(query_patch)         # torch.Size([75, 98, 768])
         # support_patch, _, _ = random_masking(support_patch)
         # # print(query_patch.shape)
@@ -338,11 +395,14 @@ def validate(val_loader,params,model,epoch_index,best_prec1,loss_fn):
         # # print(imags.shape)
         imags = imags.reshape(-1,imags.shape[2],imags.shape[3])
         imags = unpatchify(imags)
+
+        imags2 = imags2.reshape(-1,imags2.shape[2],imags2.shape[3])
+        imags2 = unpatchify(imags2)
         # print(imags.shape)
         label = torch.eq(q_values.unsqueeze(1).repeat(1,params.train_n_way*params.n_shot),cache_values.unsqueeze(0).repeat(params.train_n_way*params.n_query,1)).type(torch.float32)
         label = label.reshape(-1)
         with torch.no_grad():
-            outputs = model(imags)
+            outputs = model(imags) + model(imags2)
         outputs = F.sigmoid(outputs).reshape(-1)
         loss = loss_fn(outputs,label)
 
@@ -379,9 +439,8 @@ def validate(val_loader,params,model,epoch_index,best_prec1,loss_fn):
 
 
 def main():
-    params.global_pool = True
     model = models_vit.__dict__[params.model](
-        num_classes=1,
+        num_classes=256,
         global_pool=params.global_pool,
     )
 
@@ -400,7 +459,7 @@ def main():
             del checkpoint_model[k]
 
     # interpolate position embedding
-    # interpolate_pos_embed(model, checkpoint_model)
+    interpolate_pos_embed(model, checkpoint_model)
 
     # load pre-trained model
     msg = model.load_state_dict(checkpoint_model, strict=False)
@@ -416,7 +475,11 @@ def main():
 
     # for linear prob only
     # hack: revise model's head with BN
-    model.head = torch.nn.Sequential(torch.nn.BatchNorm1d(model.head.in_features, affine=False, eps=1e-6), model.head)
+    model.head = torch.nn.Sequential(torch.nn.BatchNorm1d(model.head.in_features, affine=False, eps=1e-6), 
+                                model.head,
+                                torch.nn.ReLU(),
+                                torch.nn.Linear(256,1)
+                                )               # 768 -> 256 -> 1
     # freeze all but the head
     # parameters = []
     for _, p in model.named_parameters():
@@ -429,7 +492,7 @@ def main():
         p.requires_grad = True
 
     model.to('cuda')
-    model = DataParallel(model,device_ids=[0,1,2])
+    model = DataParallel(model,device_ids=[0,1,2,3])   #-------------利用dp
     # ---------------------------------------------
     loss_fn = torch.nn.MSELoss()
 
@@ -437,46 +500,53 @@ def main():
     
     if params.ft:
         parameters = [p for _, p in model.module.blocks.named_parameters() if p.requires_grad]
+        # parameter = [
+        #      {'params': parameters, 'lr': 1e-3},
+        #     {'params': model.module.head.parameters(), 'lr': 1e-2}]
         parameter = [
-             {'params': parameters, 'lr': 1e-3},
             {'params': model.module.head.parameters(), 'lr': 1e-2}]
-        optimizer = torch.optim.SGD(parameter, lr=0.001, momentum=params.momentum, weight_decay=params.weight_decay)
+        optimizer = torch.optim.SGD(parameter, lr=1e-2, momentum=params.momentum, weight_decay=params.weight_decay)
+        optimizer1 = torch.optim.AdamW(parameters, lr=1e-3)
     else:
         optimizer = torch.optim.SGD([p for p in model.parameters() if p.requires_grad], lr = 0.01, momentum=params.momentum, weight_decay=params.weight_decay)
 
 
-    schedule = torch.optim.lr_scheduler.MultiStepLR(optimizer,milestones=[10,20],gamma=0.1)     #[30,60]
+    schedule = torch.optim.lr_scheduler.MultiStepLR(optimizer,milestones=[60,80],gamma=0.1)     #[30,60]
+    schedule1 = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer1, T_max =  50) 
     # epochs = params.epochs
     log('==========start training ===============')
     
     loss_all = []
     pred_all = []
     best_prec1 = 0
+    writer = SummaryWriter('./log/{}/{}'.format(params.dataset,time.strftime('%Y-%m-%d_%H-%M-%S', time.localtime())))
     for epoch in range(params.epochs): 
         log('==========training on train set===============')
-        epoch_learning_rate = 0.1
+        epoch_learning_rate = 0.01
         for param_group in optimizer.param_groups:
-            epoch_learning_rate = param_group['lr']          # scheduler.get_lr()
-            epoch_learning_rate1 = schedule.get_lr()
+            epoch_learning_rate = param_group['lr'] if not params.ft else schedule.get_lr()                      # scheduler.get_lr()
+            # epoch_learning_rate1 = schedule.get_lr()
             
         log( 'Train Epoch: {}\tLearning Rate: {}'.format(
-                            epoch, epoch_learning_rate1))
+                            epoch, epoch_learning_rate))
         # print('epoch_learning_rate1',epoch_learning_rate1)                           # -------------for debug
-        loss,pred = train(train_loader,params,model,optimizer,loss_fn,epoch)
+        loss,pred = train(train_loader,params,model,optimizer,optimizer1,loss_fn,epoch)
 
-        loss_all.append(loss.item())
-        pred_all.append(pred.item())
+        loss_all.append(loss)
+        pred_all.append(pred)
 
         schedule.step()
-
+        schedule1.step()
+        writer.add_scalar('train loss', loss, epoch)
+        writer.add_scalar('train acc', pred, epoch)
         if epoch % 1 == 0:
             log('============ Validation on the val set ============')
-            prec1, _ = validate(train_loader,params,model,epoch,best_prec1,loss_fn)
+            prec1, _ = validate(val_loader,params,model,epoch,best_prec1,loss_fn)
         
         	# record the best prec@1 and save checkpoint
         is_best = prec1 > best_prec1
         best_prec1 = max(prec1, best_prec1)
-
+        writer.add_scalar('val acc', prec1, epoch)
         # save the checkpoint
         if is_best:
             save_checkpoint(
@@ -488,8 +558,7 @@ def main():
                     'optimizer' : optimizer.state_dict(),
                 }, os.path.join(log_path, 'model_best.pth.tar'))
 
-
-        # if epoch % 2 == 0:
+        # if epoch % 10 == 0:
         #     filename = os.path.join(log_path, 'epoch_%d.pth.tar' %epoch)
         #     save_checkpoint(
         #     {

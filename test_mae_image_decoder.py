@@ -6,7 +6,7 @@ import sys
 import os
 from utils import *
 # os.environ['CUDA_VISIBLE_DEVICES'] = "3"
-
+from models.util.pos_embed import interpolate_pos_embed
 import time
 import numpy as np
 import warnings
@@ -23,7 +23,7 @@ import timm
 
 # assert timm.__version__ == "0.3.2" # version check
 from timm.models.layers import trunc_normal_
-from models import models_vit
+from models import models_vit_fsl
 
 import scipy as sp
 import scipy.stats
@@ -31,8 +31,8 @@ import scipy.stats
 import argparse
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--image_size', default=224, type=int, choices=[84, 224], help='input image size, 84 for miniImagenet and tieredImagenet, 224 for cub')
-parser.add_argument('--dataset', default='mini_imagenet', choices=['mini_imagenet','tiered_imagenet','cub','fc100'])
+parser.add_argument('--image_size', default=224, type=int, choices=[84, 112,224], help='input image size, 84 for miniImagenet and tieredImagenet, 224 for cub')
+parser.add_argument('--dataset', default='mini_imagenet', choices=['mini_imagenet','tiered_imagenet','cub','fc100','fs'])
 parser.add_argument('--data_path', default='/home/jiangweihao/data/mini-imagenet',type=str, help='dataset path')
 
 parser.add_argument('--train_n_episode', default=600, type=int, help='number of episodes in meta train')
@@ -40,7 +40,7 @@ parser.add_argument('--test_n_episode', default=1000, type=int, help='number of 
 parser.add_argument('--train_n_way', default=5, type=int, help='number of classes used for meta train')
 parser.add_argument('--val_n_way', default=5, type=int, help='number of classes used for meta val')
 parser.add_argument('--n_shot', default=5, type=int, help='number of labeled data in each class, same as n_support')
-parser.add_argument('--n_query', default=1, type=int, help='number of unlabeled data in each class')
+parser.add_argument('--n_query', default=4, type=int, help='number of unlabeled data in each class')
 parser.add_argument('--num_classes', default=64, type=int, help='total number of classes in pretrain')
 parser.add_argument('--model', default='vit_base_patch16', type=str, metavar='MODEL',
                         help='Name of model to train')
@@ -51,17 +51,17 @@ parser.add_argument('--print_freq', default=10, type=int, help='total number of 
 parser.add_argument('--momentum', default=0.9, type=int, help='parameter of optimization')
 parser.add_argument('--weight_decay', default=5.e-4, type=int, help='parameter of optimization')
 
-parser.add_argument('--gpu', default='7')
+parser.add_argument('--gpu', default='4')
 parser.add_argument('--epochs', default=100)
 
 parser.add_argument('--mlp', action='store_true')
 parser.add_argument('--ft', action='store_true')
 
 params = parser.parse_args()
-
+params.ft = True 
 # 设置日志记录路径
 log_path = os.path.dirname(os.path.abspath(__file__))
-log_path = os.path.join(log_path,'save/{}_test_task-{}_shot-{}_mae[{}]_image_complement_mlp[{}]_ft[{}]'.format(
+log_path = os.path.join(log_path,'save/{}_test_task-{}_shot-{}_mae[{}]_image_complement_mlp[{}]_ft[{}]_encoder'.format(
                                 params.dataset,params.test_n_episode,params.n_shot,params.model,params.mlp,params.ft))
 ensure_path(log_path)
 set_log_path(log_path)
@@ -221,7 +221,7 @@ def test(test_loader,params,model,epoch_index,best_prec1,loss_fn):
     for episode_index, (temp2,target) in enumerate(test_loader):   
     # temp2, _ =next(iter(train_loader))
 
-        support,query = temp2.split([params.n_shot,params.n_query],dim=1)
+        # support,query = temp2.split([params.n_shot,params.n_query],dim=1)
         cache_values, q_values = target.split([params.n_shot,params.n_query],dim=1)
 
         # cache_values = F.one_hot(cache_values).half()
@@ -229,38 +229,55 @@ def test(test_loader,params,model,epoch_index,best_prec1,loss_fn):
         q_values = q_values.reshape(-1)
         cache_values, q_values = cache_values.cuda(), q_values.cuda()
 
-        n,k,c,h,w = support.shape
-        support = support.reshape(-1,c,h,w)
-        support = support.cuda()
-        query = query.reshape(-1,c,h,w)
-        query = query.cuda()
+        n,k,c,h,w = temp2.shape
+        # support = support.reshape(-1,c,h,w)
+        # support = support.cuda()
+        # query = query.reshape(-1,c,h,w)
+        # query = query.cuda()
 
         # ---------图像组合--------------
         
         #--------方法2：将support取50%，query填充其掩码部分，互补拼接-----------
-        query_patch = patchify(query)          # torch.Size([75, 196, 768])
-        support_patch = patchify(support)  
-        imags = random_compose(query_patch,support_patch)
+        # query_patch = patchify(query)          # torch.Size([75, 196, 768])
+        # support_patch = patchify(support)  
+        # imags = random_compose(query_patch,support_patch)
 
-        imags = imags.reshape(-1,imags.shape[2],imags.shape[3])
-        imags = unpatchify(imags)
-        # print(imags.shape)
-        label = torch.eq(q_values.unsqueeze(1).repeat(1,params.val_n_way*params.n_shot),cache_values.unsqueeze(0).repeat(params.val_n_way*params.n_query,1)).type(torch.float32)
-        label = label.reshape(-1)
+        # imags = imags.reshape(-1,imags.shape[2],imags.shape[3])
+        # imags = unpatchify(imags)
+        # # print(imags.shape)
+        # label = torch.eq(q_values.unsqueeze(1).repeat(1,params.val_n_way*params.n_shot),cache_values.unsqueeze(0).repeat(params.val_n_way*params.n_query,1)).type(torch.float32)
+        # label = label.reshape(-1)
+        label = np.repeat(range(params.val_n_way),params.n_query)
+        label = torch.from_numpy(np.array(label))
+        label = label.cuda()
+        
+        imags = temp2.reshape(-1,c,h,w).cuda()
         with torch.no_grad():
             outputs = model(imags)
-        outputs = F.sigmoid(outputs).reshape(-1)
+
+        # outputs = F.sigmoid(outputs).reshape(-1)
+        # loss = loss_fn(outputs,label)
+        qf = outputs[0]                     #[125,768]
+        p,d = qf.shape
+
+        sf = outputs[1]     #[5,768]
+        
+        outputs = compute_logits(qf, sf, metric='cos')
+        outputs = outputs.reshape(params.val_n_way*params.n_query,params.train_n_way,params.train_n_way,params.val_n_way*params.n_query).sum(-1).sum(1)
         loss = loss_fn(outputs,label)
 
         # pred = outputs.reshape(-1,params.val_n_way*params.n_shot).data.max(1)[1]
-        pred = outputs.reshape(-1,params.val_n_way,params.n_shot).sum(-1).data.max(1)[1]
+        # pred = outputs.reshape(-1,params.val_n_way,params.n_shot).sum(-1).data.max(1)[1]
+        pred = outputs.data.max(1)[1]
         y = np.repeat(range(params.val_n_way),params.n_query)
         y = torch.from_numpy(y)
         y = y.cuda()
-        pred = pred.eq(y).sum()/params.val_n_way/params.n_query
+
+        num = params.val_n_way*params.n_query
+        pred = pred.eq(y).sum()/num
         
-        losses.update(loss.item(), query_patch.size(0))
-        top1.update(pred, query_patch.size(0))
+        losses.update(loss.item(), label.size(0))
+        top1.update(pred, num)
         accuracies.append(pred)
         
         best_prec1 = max(best_prec1, top1.val)
@@ -286,34 +303,36 @@ def test(test_loader,params,model,epoch_index,best_prec1,loss_fn):
 
 def main():
 
-    model = models_vit.__dict__[params.model](
-        num_classes=1 if not params.mlp else 256,
+    model = models_vit_fsl.__dict__[params.model](
+        num_classes=0,
         global_pool=params.global_pool,
+        img_size = params.image_size
     )
 
 
     # checkpoint = torch.load('/home/jiangweihao/CodeLab/PytorchCode/MAE_fsl/save/mini_imagenet_train_task-600_shot-5_mae_image_compolement/model_best.pth.tar')
     # model.head = torch.nn.Sequential(torch.nn.BatchNorm1d(model.head.in_features, affine=False, eps=1e-6), model.head)
 
-    if not params.mlp:
-        checkpoint = torch.load('/home/jiangweihao/code/MAE_fsl/save/mini_imagenet_train_task-600_shot-5_mae[vit_large_patch16]_image_compolement_FT[True]_global[True]/model_best.pth.tar')
-        model.head = torch.nn.Sequential(torch.nn.BatchNorm1d(model.head.in_features, affine=False, eps=1e-6), model.head)
-        if params.ft:
-            checkpoint = torch.load('/home/jiangweihao/code/MAE_fsl/save/tiered_imagenet_train_task-600_shot-5_mae[vit_large_patch16]_image_compolement_FT[True]onelayer_global[True]/model_best.pth.tar')  
-            # model.head = torch.nn.Sequential(torch.nn.BatchNorm1d(model.head.in_features, affine=False, eps=1e-6), model.head)
-    else:
-        checkpoint = torch.load('/home/jiangweihao/CodeLab/PytorchCode/MAE_fsl/save/mini_imagenet_train_task-600_shot-5_mae_image_compolement_mlp/model_best.pth.tar')
-        model.head = torch.nn.Sequential(torch.nn.BatchNorm1d(model.head.in_features, affine=False, eps=1e-6), 
-                                    model.head,
-                                    torch.nn.ReLU(),
-                                    torch.nn.Linear(256,1)
-                                    )               # 768 -> 256 -> 1
+    if params.dataset == 'mini_imagenet':    #mini_imagenet','tiered_imagenet','cub','fc100','fs'
+        checkpoint = torch.load('/home/jiangweihao/code/MAE_fsl/save/mini_imagenet_train_task-600_shot-5_mae[vit_base_patch16]_image_compolement_FT[True]_global[False]_encoder/model_best.pth.tar')
+    elif params.dataset == 'tiered_imagenet':    #mini_imagenet','tiered_imagenet','cub','fc100','fs'
+        checkpoint = torch.load('/home/jiangweihao/code/MAE_fsl/save/tiered_imagenet_train_task-600_shot-5_mae[vit_base_patch16]_image_compolement_FT[True]_global[False]_encoder_lr0.001_adam/model_best.pth.tar')
+    elif params.dataset == 'fc100':    #mini_imagenet','tiered_imagenet','cub','fc100','fs'
+        checkpoint = torch.load('/home/jiangweihao/code/MAE_fsl/save/fc100_train_task-600_shot-5_mae[vit_base_patch16]_image_compolement_FT[True]_global[False]_encoder_lr0.001/model_best.pth.tar')
+    elif params.dataset == 'fs':    #mini_imagenet','tiered_imagenet','cub','fc100','fs'
+        checkpoint = torch.load('/home/jiangweihao/code/MAE_fsl/save/fs_train_task-600_shot-5_mae[vit_base_patch16]_image_compolement_FT[True]_global[False]_encoder_lr0.001_adam-/model_best.pth.tar')
+   
     if params.model == 'vit_large_patch16':   
         checkpoint = torch.load('/home/jiangweihao/code/MAE_fsl/save/mini_imagenet_train_task-600_shot-5_mae[vit_large_patch16]_image_compolement_FT[True]onelayer_global[True]/model_best.pth.tar')
+    
+    # interpolate position embedding
+    interpolate_pos_embed(model, checkpoint['state_dict'])
+
     model.load_state_dict(checkpoint['state_dict'], strict=True)
     model.to('cuda')
     # ---------------------------------------------
-    loss_fn = torch.nn.MSELoss()
+    # loss_fn = torch.nn.MSELoss()
+    loss_fn = torch.nn.CrossEntropyLoss()
 
     epochs = 1
     log('==========start testing ===============')

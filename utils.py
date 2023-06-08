@@ -354,6 +354,50 @@ def random_compose(x, y, mask_ratio=0.5):
 
     return x
 
+def random_compose_v2(x, y, mask_ratio=0.5):
+    """
+    Perform per-sample random masking by per-sample shuffling.
+    Per-sample shuffling is done by argsort random noise.
+    x: [N, L, D], sequence, query
+    y: [N, L, D], sequence, support
+    """
+    N, L, D = x.shape  # batch, length, dim
+    N1 = y.shape[0]  # batch, length, dim
+    len_keep = int(L * (1 - mask_ratio))
+    
+    noise = torch.rand(N, L, device=x.device)  # noise in [0, 1]
+    
+    # sort noise for each sample
+    ids_shuffle = torch.argsort(noise, dim=1)  # ascend: small is keep, large is remove
+    ids_restore = torch.argsort(ids_shuffle, dim=1)
+
+    # keep the first subset
+    # ids_keep = ids_shuffle[:, :len_keep]
+    # x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
+
+    # ids_keep = ids_shuffle[:, len_keep:L]
+    # y_masked = torch.gather(y, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
+
+    # generate the binary mask: 0 is keep, 1 is remove
+    mask = torch.ones([N, L], device=x.device)
+    one = mask
+    mask[:, :len_keep] = 0
+    # unshuffle to get the binary mask
+    mask = torch.gather(mask, dim=1, index=ids_restore)
+    mask = mask.unsqueeze(1).repeat(1,N1,1).unsqueeze(-1).repeat(1,1,1,D)
+    one = one.unsqueeze(1).repeat(1,N1,1).unsqueeze(-1).repeat(1,1,1,D)
+    x = x.unsqueeze(1).repeat(1,N1,1,1)
+    y = y.unsqueeze(0).repeat(N,1,1,1)
+    x0 = x * mask
+    y0 = y * mask
+    x = x * (1-mask)
+    y = y * (1-mask)
+   
+    x = x0 + y
+    y = x + y0
+
+    return x,y
+
 def mean_confidence_interval(data, confidence=0.95):
     a = 1.0*np.array(data)
     n = len(a)

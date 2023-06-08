@@ -6,7 +6,7 @@ import sys
 import os
 from utils import *
 # os.environ['CUDA_VISIBLE_DEVICES'] = "3"
-
+from models.util.pos_embed import interpolate_pos_embed
 import time
 import numpy as np
 import warnings
@@ -31,9 +31,9 @@ import scipy.stats
 import argparse
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--image_size', default=224, type=int, choices=[84, 224], help='input image size, 84 for miniImagenet and tieredImagenet, 224 for cub')
-parser.add_argument('--dataset', default='mini_imagenet', choices=['mini_imagenet','tiered_imagenet','cub','fc100'])
-parser.add_argument('--data_path', default='/home/jiangweihao/data/mini-imagenet',type=str, help='dataset path')
+parser.add_argument('--image_size', default=224, type=int, choices=[84, 96, 112, 224], help='input image size, 84 for miniImagenet and tieredImagenet, 224 for cub')
+parser.add_argument('--dataset', default='mini_imagenet', choices=['mini_imagenet','tiered_imagenet','cub','fc100','dtd','eurosat','pets','fs'])
+parser.add_argument('--data_path', default='/data/jiangweihao/data/mini-imagenet',type=str, help='dataset path')
 
 parser.add_argument('--train_n_episode', default=600, type=int, help='number of episodes in meta train')
 parser.add_argument('--test_n_episode', default=1000, type=int, help='number of episodes in meta val')
@@ -42,26 +42,27 @@ parser.add_argument('--val_n_way', default=5, type=int, help='number of classes 
 parser.add_argument('--n_shot', default=5, type=int, help='number of labeled data in each class, same as n_support')
 parser.add_argument('--n_query', default=1, type=int, help='number of unlabeled data in each class')
 parser.add_argument('--num_classes', default=64, type=int, help='total number of classes in pretrain')
-parser.add_argument('--model', default='vit_base_patch16', type=str, metavar='MODEL',
+parser.add_argument('--model', default='vit_large_patch16', type=str, metavar='MODEL',
                         help='Name of model to train')
 parser.add_argument('--global_pool', action='store_true')
 parser.add_argument('--batch_size', default=128, type=int, help='total number of batch_size in pretrain')
 parser.add_argument('--print_freq', default=10, type=int, help='total number of inner frequency')
 
-parser.add_argument('--momentum', default=0.9, type=int, help='parameter of optimization')
-parser.add_argument('--weight_decay', default=5.e-4, type=int, help='parameter of optimization')
+parser.add_argument('--momentum', default=0.9, type=float, help='parameter of optimization')
+parser.add_argument('--weight_decay', default=5.e-4, type=float, help='parameter of optimization')
+parser.add_argument('--temp', default=1.0, type=float, help='parameter of optimization')
 
-parser.add_argument('--gpu', default='7')
+parser.add_argument('--gpu', default='0')
 parser.add_argument('--epochs', default=100)
 
 parser.add_argument('--mlp', action='store_true')
 parser.add_argument('--ft', action='store_true')
 
 params = parser.parse_args()
-
+params.global_pool = True
 # 设置日志记录路径
 log_path = os.path.dirname(os.path.abspath(__file__))
-log_path = os.path.join(log_path,'save/{}_test_task-{}_shot-{}_mae[{}]_image_complement_mlp[{}]_ft[{}]'.format(
+log_path = os.path.join(log_path,'save/{}_test_task-{}_shot-{}_mae[{}]_image_complement_mlp[{}]_ft[{}]_v1'.format(
                                 params.dataset,params.test_n_episode,params.n_shot,params.model,params.mlp,params.ft))
 ensure_path(log_path)
 set_log_path(log_path)
@@ -83,19 +84,31 @@ elif params.dataset == 'cub':
     val_file = 'val.json'
     test_file = 'novel.json'
     json_file_read = True
-    params.num_classes = 200
-    params.data_path = '/home/jiangweihao/data/data/CUB'
+    params.num_classes = 200    
+    params.data_path = '/home/jiangweihao/CodeLab/data/CUB'
 elif params.dataset == 'tiered_imagenet':
     base_file = 'train'
     val_file = 'val'
-    test_file = 'test'
     params.num_classes = 351
-    params.data_path = '/home/jiangweihao/data/tiered_imagenet'
+    params.data_path = '/data/jiangweihao/data/tiered_imagenet'
 elif params.dataset == 'fc100':
     base_file = 'train'
     val_file = 'val'
-    test_file = 'test'
     params.num_classes = 60
+    params.data_path = '/home/jiangweihao/data/FC100'
+elif params.dataset == 'fs':
+    base_file = 'train'
+    val_file = 'val'
+    params.num_classes = 64
+    params.data_path = '/home/jiangweihao/data/CIFAR_FS'
+elif params.dataset == 'dtd':
+    base_file = 'images'
+    test_file = 'images'
+    params.data_path = '/data/jiangweihao/data/dtd'
+elif params.dataset == 'eurosat':
+    base_file = 'EuroSAT'
+    test_file = 'EuroSAT'
+    params.data_path = '/data/jiangweihao/data'
 else:
     ValueError('dataset error')
 
@@ -240,16 +253,19 @@ def test(test_loader,params,model,epoch_index,best_prec1,loss_fn):
         #--------方法2：将support取50%，query填充其掩码部分，互补拼接-----------
         query_patch = patchify(query)          # torch.Size([75, 196, 768])
         support_patch = patchify(support)  
-        imags = random_compose(query_patch,support_patch)
+        imags, imags2= random_compose_v2(query_patch,support_patch)
 
         imags = imags.reshape(-1,imags.shape[2],imags.shape[3])
         imags = unpatchify(imags)
+
+        imags2 = imags2.reshape(-1,imags2.shape[2],imags2.shape[3])
+        imags2 = unpatchify(imags2)
         # print(imags.shape)
         label = torch.eq(q_values.unsqueeze(1).repeat(1,params.val_n_way*params.n_shot),cache_values.unsqueeze(0).repeat(params.val_n_way*params.n_query,1)).type(torch.float32)
         label = label.reshape(-1)
         with torch.no_grad():
-            outputs = model(imags)
-        outputs = F.sigmoid(outputs).reshape(-1)
+            outputs = model(imags) + model(imags2)
+        outputs = F.sigmoid(outputs/params.temp).reshape(-1)
         loss = loss_fn(outputs,label)
 
         # pred = outputs.reshape(-1,params.val_n_way*params.n_shot).data.max(1)[1]
@@ -287,31 +303,35 @@ def test(test_loader,params,model,epoch_index,best_prec1,loss_fn):
 def main():
 
     model = models_vit.__dict__[params.model](
-        num_classes=1 if not params.mlp else 256,
+        num_classes=256,
         global_pool=params.global_pool,
+        img_size=params.image_size
     )
 
 
     # checkpoint = torch.load('/home/jiangweihao/CodeLab/PytorchCode/MAE_fsl/save/mini_imagenet_train_task-600_shot-5_mae_image_compolement/model_best.pth.tar')
     # model.head = torch.nn.Sequential(torch.nn.BatchNorm1d(model.head.in_features, affine=False, eps=1e-6), model.head)
-
-    if not params.mlp:
-        checkpoint = torch.load('/home/jiangweihao/code/MAE_fsl/save/mini_imagenet_train_task-600_shot-5_mae[vit_large_patch16]_image_compolement_FT[True]_global[True]/model_best.pth.tar')
-        model.head = torch.nn.Sequential(torch.nn.BatchNorm1d(model.head.in_features, affine=False, eps=1e-6), model.head)
-        if params.ft:
-            checkpoint = torch.load('/home/jiangweihao/code/MAE_fsl/save/tiered_imagenet_train_task-600_shot-5_mae[vit_large_patch16]_image_compolement_FT[True]onelayer_global[True]/model_best.pth.tar')  
-            # model.head = torch.nn.Sequential(torch.nn.BatchNorm1d(model.head.in_features, affine=False, eps=1e-6), model.head)
-    else:
-        checkpoint = torch.load('/home/jiangweihao/CodeLab/PytorchCode/MAE_fsl/save/mini_imagenet_train_task-600_shot-5_mae_image_compolement_mlp/model_best.pth.tar')
-        model.head = torch.nn.Sequential(torch.nn.BatchNorm1d(model.head.in_features, affine=False, eps=1e-6), 
+    model.head = torch.nn.Sequential(torch.nn.BatchNorm1d(model.head.in_features, affine=False, eps=1e-6), 
                                     model.head,
                                     torch.nn.ReLU(),
                                     torch.nn.Linear(256,1)
                                     )               # 768 -> 256 -> 1
-    if params.model == 'vit_large_patch16':   
-        checkpoint = torch.load('/home/jiangweihao/code/MAE_fsl/save/mini_imagenet_train_task-600_shot-5_mae[vit_large_patch16]_image_compolement_FT[True]onelayer_global[True]/model_best.pth.tar')
+    if params.dataset == 'mini_imagenet':    #mini_imagenet','tiered_imagenet','cub','fc100','fs'
+        checkpoint = torch.load('/data/jiangweihao/code/MAE_fsl/save/mini_imagenet_train_task-600_shot-{}_mae[{}]_image_compolement_FT[True]_global[True]_mlp_v1/model_best.pth.tar'.format(params.n_shot,params.model))
+    elif params.dataset == 'tiered_imagenet':    #mini_imagenet','tiered_imagenet','cub','fc100','fs'
+        checkpoint = torch.load('/data/jiangweihao/code/MAE_fsl/save/mini_imagenet_train_task-600_shot-{}_mae[{}]_image_compolement_FT[True]_global[True]_mlp_v1/model_best.pth.tar'.format(params.n_shot,params.model))
+    elif params.dataset == 'fc100':    #mini_imagenet','tiered_imagenet','cub','fc100','fs'
+        checkpoint = torch.load('/home/jiangweihao/code/MAE_fsl/save/fc100_train_task-600_shot-{}_mae[{}]_image_compolement_FT[True]_global[True]_mlp_v1/model_best.pth.tar'.format(params.n_shot,params.model))
+    elif params.dataset == 'fs':    #mini_imagenet','tiered_imagenet','cub','fc100','fs'
+        checkpoint = torch.load('/data/jiangweihao/code/MAE_fsl/save/fs_train_task-600_shot-{}_mae[{}]_image_compolement_FT[True]_global[True]_mlp_v1/model_best.pth.tar'.format(params.n_shot,params.model))
+    
+    # interpolate position embedding
+    interpolate_pos_embed(model, checkpoint['state_dict'])
+
     model.load_state_dict(checkpoint['state_dict'], strict=True)
     model.to('cuda')
+    if 'temp' in checkpoint:
+         params.temp = checkpoint['temp'] 
     # ---------------------------------------------
     loss_fn = torch.nn.MSELoss()
 
